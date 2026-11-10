@@ -139,8 +139,8 @@ def test_command_origin_error_is_body_relative():
 
 
 def test_cfg_preserves_layout_and_has_real_body_contacts():
-    import re
     import mujoco
+    from mjlab.scene import Scene
     from mjlab_microduck.tasks.microduck_turn360_env_cfg import (
         make_microduck_turn360_env_cfg, MicroduckTurn360RlCfg,
     )
@@ -162,8 +162,33 @@ def test_cfg_preserves_layout_and_has_real_body_contacts():
         model = spec.compile()
         assert model.nu == 14
         sensor = next(s for s in cfg.scene.sensors if s.name == "turn_body_ground")
-        names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) for i in range(model.ngeom)]
-        assert any(name and re.match(sensor.primary.pattern, name) for name in names)
-        assert not re.match(sensor.primary.pattern, "left_foot_collision")
-        assert not re.match(sensor.primary.pattern, "right_foot_collision")
+        colliders = {
+            geom.name for geom in spec.geoms
+            if (geom.contype or geom.conaffinity)
+            and geom.name not in ("left_foot_collision", "right_foot_collision")
+        }
+        assert "" not in colliders
+        assert set(sensor.primary.pattern) == colliders
+        assert len(sensor.primary.pattern) == len(set(sensor.primary.pattern))
+        assert not {"left_foot_collision", "right_foot_collision"} & colliders
+        # Compile the complete scene, including expanded sensor definitions.
+        # Robot-only compilation missed repeated names from anonymous geoms.
+        cfg.scene.num_envs = 1
+        scene_model = Scene(cfg.scene, device="cpu").compile()
+        sensors = [mujoco.mj_id2name(scene_model, mujoco.mjtObj.mjOBJ_SENSOR, i)
+                   for i in range(scene_model.nsensor)]
+        body_sensors = [name for name in sensors if name.startswith("turn_body_ground_")]
+        assert len(body_sensors) == len(colliders)
+        assert len(body_sensors) == len(set(body_sensors))
     assert MicroduckTurn360RlCfg.algorithm.symmetry_cfg is None
+
+
+def test_naming_anonymous_contacts_does_not_change_physics():
+    import numpy as np
+    from mjlab_microduck.robot.microduck_constants import get_allcollisions_spec
+    from mjlab_microduck.tasks.microduck_turn360_env_cfg import get_turn360_spec
+
+    original, named = get_allcollisions_spec().compile(), get_turn360_spec().compile()
+    for field in ("geom_pos", "geom_quat", "geom_size", "geom_friction", "geom_condim",
+                  "geom_contype", "geom_conaffinity", "body_mass", "body_inertia"):
+        np.testing.assert_array_equal(getattr(original, field), getattr(named, field))

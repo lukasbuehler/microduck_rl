@@ -12,7 +12,10 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import RewardTermCfg, TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 
-from mjlab_microduck.robot.microduck_constants import MICRODUCK_ALLCOLLISIONS_ROBOT_CFG
+from mjlab_microduck.robot.microduck_constants import (
+    MICRODUCK_ALLCOLLISIONS_ROBOT_CFG,
+    get_allcollisions_spec,
+)
 from mjlab_microduck.tasks import mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
     MicroduckRlCfg,
@@ -24,17 +27,38 @@ EPISODE_LENGTH_S = 8.0
 ENABLE_VELOCITY_PUSHES = False
 
 
+def get_turn360_spec():
+    """Name anonymous colliders without changing geometry or contact settings.
+
+    mjlab creates one contact sensor per geom name. Anonymous primaries would
+    all produce the same sensor name, so excluding only the feet is insufficient.
+    No `_collision` suffix: that would change which CollisionCfg rules apply.
+    """
+    spec = get_allcollisions_spec()
+    for index, geom in enumerate(spec.geoms):
+        if not geom.name and (geom.contype or geom.conaffinity):
+            geom.name = f"turn_contact_{index}"
+    return spec
+
+
 def make_microduck_turn360_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg = deepcopy(make_microduck_velocity_env_cfg(play=play))
     # Feet-only walking collisions would let the body pass through the floor.
     cfg.scene.entities["robot"] = deepcopy(MICRODUCK_ALLCOLLISIONS_ROBOT_CFG)
+    cfg.scene.entities["robot"].spec_fn = get_turn360_spec
+    robot_spec = get_turn360_spec()  # keep the owning MjSpec alive while reading its geoms
+    body_geoms = tuple(
+        geom.name for geom in robot_spec.geoms
+        if (geom.contype or geom.conaffinity)
+        and geom.name not in ("left_foot_collision", "right_foot_collision")
+    )
     cfg.sim.nconmax = 200
     cfg.scene.sensors += (
         ContactSensorCfg(
             name="turn_body_ground",
             primary=ContactMatch(
                 mode="geom",
-                pattern=r"^(?!left_foot_collision$|right_foot_collision$).*",
+                pattern=body_geoms,
                 entity="robot",
             ),
             secondary=ContactMatch(mode="body", pattern="terrain"),

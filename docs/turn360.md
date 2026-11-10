@@ -148,7 +148,7 @@ uv run --extra tracking --with pytest pytest tests/test_turn360.py tests/test_tr
 ```
 
 Checks cover yaw wraparound, bounded/non-repeatable progress, stable completion,
-failure conditions, partial resets, observation layout, model compilation and
+failure conditions, partial resets, observation layout, complete scene/sensor compilation and
 live TensorBoard-to-MLflow logging with parameter/artifact capture.
 
 Initial local physics check (CPU MuJoCo, nominal BAM M6, full-collision robot,
