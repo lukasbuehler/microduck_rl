@@ -24,6 +24,14 @@ def test_trainer_option_spellings():
         take_option(["--agent.run-name"], "--agent.run-name", "y")
 
 
+def test_regex_selectors_are_preserved_as_json_values():
+    params = flatten_params({"joint_pos": {".*": 0.0, ".*hip_yaw.*": 0.1},
+                             "reward": {"weight": 8.0}}, "env")
+    assert params["env.joint_pos"] == '{".*": 0.0, ".*hip_yaw.*": 0.1}'
+    assert params["env.reward.weight"] == "8.0"
+    assert not any("*" in key for key in params)
+
+
 def test_bridge_waits_for_config_dump_to_finish(tmp_path):
     pytest.importorskip("mlflow")
     from mjlab_microduck.tracking import TensorboardBridge
@@ -46,6 +54,12 @@ def test_live_bridge_logs_new_events_once_and_resolved_params(tmp_path):
     directory = tmp_path / "training"
     (directory / "params").mkdir(parents=True)
     (directory / "params/agent.yaml").write_text("seed: 42\nalgorithm:\n  learning_rate: 0.001\n")
+    # Exercise the actual environment config, including terrain/joint regex
+    # dictionaries that simple synthetic configs did not cover.
+    from dataclasses import asdict
+    from mjlab.utils.os import dump_yaml
+    from mjlab_microduck.tasks.microduck_turn360_env_cfg import make_microduck_turn360_env_cfg
+    dump_yaml(directory / "params/env.yaml", asdict(make_microduck_turn360_env_cfg()))
     writer = SummaryWriter(str(directory))
     writer.add_scalar("Episode_Reward/turn_progress", 0.25, 1)
     writer.flush()
@@ -59,6 +73,9 @@ def test_live_bridge_logs_new_events_once_and_resolved_params(tmp_path):
     assert [(m.step, m.value) for m in history] == [(1, 0.25), (2, 0.5)]
     assert client.get_run(run_id).data.params["agent.seed"] == "42"
     assert client.get_run(run_id).data.params["agent.algorithm.learning_rate"] == "0.001"
+    assert client.get_run(run_id).data.params["env.rewards.turn_progress.weight"] == "8.0"
+    joint_key = "env.scene.terrain.init_state.joint_pos"
+    assert ".*" in client.get_run(run_id).data.params[joint_key]
     assert client.list_artifacts(run_id, "params")[0].path == "params/agent.yaml"
     client.set_terminated(run_id)
 

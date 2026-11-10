@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,9 +21,14 @@ import uuid
 
 
 def flatten_params(value, prefix=""):
-    """Indexable scalar config; full/large structures remain YAML artifacts."""
+    """Indexable config; regex-keyed maps stay JSON values, not MLflow keys.
+
+    Joint selectors such as `.*` are valid configuration keys but invalid
+    MLflow parameter names. Keep these maps intact instead of lossy renaming.
+    Full/large structures also remain available in the YAML artifacts.
+    """
     result = {}
-    if isinstance(value, dict):
+    if isinstance(value, dict) and all(re.fullmatch(r"[\w-]+", str(key)) for key in value):
         for key, child in value.items():
             result.update(flatten_params(child, f"{prefix}.{key}" if prefix else str(key)))
     else:
