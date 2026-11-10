@@ -79,6 +79,15 @@ from .microduck_roulade_env_cfg import (
     MicroduckRouladeRlCfg,
 )
 from .backlash import make_backlash_variant
+from .microduck_turn360_env_cfg import make_microduck_turn360_env_cfg, MicroduckTurn360RlCfg
+
+register_mjlab_task(
+    task_id="Mjlab-Turn360-Flat-MicroDuck",
+    env_cfg=make_microduck_turn360_env_cfg(),
+    play_env_cfg=make_microduck_turn360_env_cfg(play=True),
+    rl_cfg=MicroduckTurn360RlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Standard velocity task
 register_mjlab_task(

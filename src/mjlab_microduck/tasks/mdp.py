@@ -7705,3 +7705,186 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Turn360: one grounded, counterclockwise revolution and a stable stop.         #
+# --------------------------------------------------------------------------- #
+
+class Turn360Command(CommandTerm):
+    """Own episode state once, shared by commands, rewards and terminations.
+
+    mjlab evaluates terminations before rewards and commands. update() is
+    step-guarded so these consumers cannot integrate rotation/hold time twice.
+    Reset origins are captured after forward(), not from stale pre-reset FK.
+    """
+
+    cfg: "Turn360CommandCfg"
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._command = torch.zeros(self.num_envs, 3, device=self.device)
+        self.origin = torch.zeros(self.num_envs, 2, device=self.device)
+        self.angle = torch.zeros(self.num_envs, device=self.device)
+        self.frontier = torch.zeros_like(self.angle)
+        self.progress = torch.zeros_like(self.angle)
+        self.last_yaw = torch.zeros_like(self.angle)
+        self.elapsed = torch.zeros_like(self.angle)
+        self.hold = torch.zeros_like(self.angle)
+        self.air_time = torch.zeros_like(self.angle)
+        self.drift = torch.zeros_like(self.angle)
+        self.tilt = torch.zeros_like(self.angle)
+        self.angular_speed = torch.zeros_like(self.angle)
+        self.failed = torch.zeros_like(self.angle, dtype=torch.bool)
+        self.succeeded = torch.zeros_like(self.failed)
+        self._pending = torch.ones_like(self.failed)
+        self._needs_reset_capture = True
+        self._last_step = -1
+        self.metrics = {
+            name: torch.zeros_like(self.angle)
+            for name in ("turns", "yaw_error_rad", "peak_drift_m", "peak_tilt_rad",
+                         "duration_s", "success")
+        }
+
+    @property
+    def command(self):
+        return self._command
+
+    def _resample_command(self, env_ids):
+        for value in (self.angle, self.frontier, self.progress, self.elapsed,
+                      self.hold, self.air_time, self.drift, self.tilt):
+            value[env_ids] = 0.0
+        self.failed[env_ids] = False
+        self.succeeded[env_ids] = False
+        self._pending[env_ids] = True
+        self._needs_reset_capture = True
+        self._command[env_ids] = 0.0
+        self._command[env_ids, 0] = 1.0
+
+    def _update_metrics(self):
+        self.update()
+
+    def _update_command(self):
+        self.update()
+
+    def update(self):
+        env = self._env
+        if self._last_step == int(env.common_step_counter) and not self._needs_reset_capture:
+            return
+        data = env.scene["robot"].data
+        q = data.root_link_quat_w
+        w, x, y, z = q.unbind(-1)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        xy = data.root_link_pos_w[:, :2]
+        pending = self._pending.clone()
+        self.origin[pending] = xy[pending]
+        self.last_yaw[pending] = yaw[pending]
+        self._pending[:] = False
+        self._needs_reset_capture = False
+
+        if self._last_step != int(env.common_step_counter):
+            active = ~pending
+            dt = env.step_dt
+            delta = wrap_to_pi(yaw - self.last_yaw)
+            self.angle += torch.where(active, delta, 0.0)
+            self.last_yaw.copy_(yaw)
+            self.elapsed += active * dt
+            self.drift = torch.linalg.vector_norm(xy - self.origin, dim=-1)
+            self.tilt = torch.acos((1 - 2 * (x * x + y * y)).clamp(-1, 1))
+            self.angular_speed = torch.linalg.vector_norm(data.root_link_ang_vel_b, dim=-1)
+            linear_speed = torch.linalg.vector_norm(data.root_link_lin_vel_b, dim=-1)
+            supported = _sensor_any_contact(env, "feet_ground_contact")
+            body_contact = _sensor_any_contact(env, "turn_body_ground")
+            if supported is None or body_contact is None:
+                raise RuntimeError("Turn360 requires feet and non-foot ground-contact sensors")
+            self.air_time = torch.where(supported, 0.0, self.air_time + active * dt)
+            finite = torch.isfinite(torch.cat((q, xy, data.root_link_ang_vel_b,
+                                               data.root_link_lin_vel_b), dim=-1)).all(-1)
+            self.failed = active & (
+                ~finite | body_contact | (self.tilt > self.cfg.failure_tilt)
+                | (self.drift > self.cfg.failure_radius)
+                | ((self.elapsed > 0.25) & (self.air_time > self.cfg.max_air_time))
+            )
+            valid = active & supported & ~self.failed & (self.tilt < self.cfg.progress_tilt)
+            candidate = self.angle.clamp(0.0, self.cfg.target_angle)
+            frontier = torch.where(valid, torch.maximum(self.frontier, candidate), self.frontier)
+            self.progress = frontier - self.frontier
+            self.frontier = frontier
+            near_goal = (self.angle - self.cfg.target_angle).abs() < self.cfg.angle_tolerance
+            stable = (
+                valid & near_goal & (self.frontier >= self.cfg.target_angle - self.cfg.angle_tolerance)
+                & (self.tilt < self.cfg.success_tilt) & (self.drift < self.cfg.success_radius)
+                & (self.angular_speed < self.cfg.stop_angular_speed)
+                & (linear_speed < self.cfg.stop_linear_speed)
+            )
+            self.hold = torch.where(stable, self.hold + active * dt, 0.0)
+            self.succeeded = stable & (self.hold >= self.cfg.hold_time)
+            self.metrics["turns"].copy_(self.angle / (2 * math.pi))
+            self.metrics["yaw_error_rad"].copy_((self.cfg.target_angle - self.angle).abs())
+            self.metrics["peak_drift_m"] = torch.maximum(self.metrics["peak_drift_m"], self.drift)
+            self.metrics["peak_tilt_rad"] = torch.maximum(self.metrics["peak_tilt_rad"], self.tilt)
+            self.metrics["duration_s"].copy_(self.elapsed)
+            self.metrics["success"].copy_(self.succeeded.float())
+            self._last_step = int(env.common_step_counter)
+
+        # Remaining signed turns plus body-frame displacement back to the origin.
+        # These are task commands, NOT a desired velocity (same 3D slot size).
+        offset = self.origin - xy
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        self._command[:, 0] = ((self.cfg.target_angle - self.angle) / (2 * math.pi)).clamp(-2, 2)
+        self._command[:, 1] = ((c * offset[:, 0] + s * offset[:, 1]) / self.cfg.success_radius).clamp(-2, 2)
+        self._command[:, 2] = ((-s * offset[:, 0] + c * offset[:, 1]) / self.cfg.success_radius).clamp(-2, 2)
+
+
+@_dataclass(kw_only=True)
+class Turn360CommandCfg(CommandTermCfg):
+    target_angle: float = 2 * math.pi
+    angle_tolerance: float = math.radians(10)
+    progress_tilt: float = math.radians(30)
+    success_tilt: float = math.radians(15)
+    failure_tilt: float = math.radians(45)
+    success_radius: float = 0.06
+    failure_radius: float = 0.20
+    stop_angular_speed: float = 0.3
+    stop_linear_speed: float = 0.05
+    hold_time: float = 0.3
+    max_air_time: float = 0.06
+
+    def build(self, env):
+        return Turn360Command(self, env)
+
+
+def turn360_done(env: ManagerBasedRlEnv, success: bool) -> torch.Tensor:
+    command = env.command_manager.get_term("twist")
+    command.update()
+    return command.succeeded if success else command.failed
+
+
+def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
+    """Separate logged terms. mjlab multiplies all rewards by step_dt.
+
+    Delta-progress and terminal impulses are divided by dt to preserve their
+    total payout; other terms are costs per second. No standing-still reward.
+    """
+    cmd = env.command_manager.get_term("twist")
+    cmd.update()
+    if component == "progress":
+        return cmd.progress / cmd.cfg.target_angle / env.step_dt
+    if component == "success":
+        return cmd.succeeded.float() / env.step_dt
+    if component == "failure":
+        return cmd.failed.float() / env.step_dt
+    if component == "time":
+        return torch.ones_like(cmd.angle)
+    if component == "remaining":
+        return ((cmd.cfg.target_angle - cmd.angle).abs() / cmd.cfg.target_angle).clamp(max=2)
+    if component == "tilt":
+        return torch.sin(cmd.tilt).square()
+    if component == "drift":
+        return (cmd.drift / cmd.cfg.success_radius).square()
+    if component == "braking":
+        gate = ((cmd.angle / cmd.cfg.target_angle - 0.75) / 0.25).clamp(0, 1)
+        return gate * cmd.angular_speed.square()
+    if component == "effort":
+        return env.scene["robot"].data.actuator_force.square().sum(-1)
+    raise ValueError(f"Unknown Turn360 reward component: {component}")

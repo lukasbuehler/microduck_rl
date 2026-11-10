@@ -57,6 +57,9 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 
 ## Tasks
 
+Custom experiment: [one fast, stable 360° turn](docs/turn360.md)
+(`Mjlab-Turn360-Flat-MicroDuck`), with local MLflow experiment tracking.
+
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.
 
 <!-- SHOWCASE GRID — one short GIF per task family (sim or real), 3 per row.

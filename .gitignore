@@ -37,4 +37,7 @@ backup_onnx/
 
 logdir/.claude/
 logdir/
+mlruns/
+mlartifacts/
+mlflow.db*
 logdir/.claude/worktrees/
