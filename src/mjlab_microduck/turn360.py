@@ -22,6 +22,15 @@ class Turn360Goal:
     stop_linear_speed: float = 0.05
     hold_time: float = 0.3
     max_air_time: float = 0.06
+    # Training-only soft limits. None reproduces the original reward.
+    max_yaw_rate: float | None = None
+    max_joint_speed: float | None = None
+
+    def __post_init__(self):
+        for name in ("max_yaw_rate", "max_joint_speed"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be a positive finite value in rad/s, or None")
 
 
 def yaw_from_quat(quaternion):
@@ -42,16 +51,22 @@ class Turn360Playback:
         self.last_yaw = yaw_from_quat(quaternion)
         self.angle = self.frontier = self.elapsed = self.hold = self.air_time = 0.0
         self.hold = np.float32(0.0)
+        self.peak_yaw_rate = self.peak_joint_speed = 0.0
         self.command = np.array([1., 0., 0.], dtype=np.float32)
 
     def update(self, dt, position, quaternion, linear_velocity, angular_velocity,
-               supported, body_contact):
+               supported, body_contact, joint_velocity=None):
         if not np.isfinite(np.concatenate((position, quaternion, linear_velocity, angular_velocity))).all():
             return "invalid state"
         goal = self.goal
         yaw = yaw_from_quat(quaternion)
         delta = yaw - self.last_yaw
-        self.angle += (delta + math.pi) % (2 * math.pi) - math.pi
+        increment = (delta + math.pi) % (2 * math.pi) - math.pi
+        self.angle += increment
+        if dt > 0:
+            self.peak_yaw_rate = max(self.peak_yaw_rate, abs(increment) / dt)
+        if joint_velocity is not None:
+            self.peak_joint_speed = max(self.peak_joint_speed, float(np.max(np.abs(joint_velocity))))
         self.last_yaw = yaw
         self.elapsed += dt
         self.air_time = 0.0 if supported else self.air_time + dt

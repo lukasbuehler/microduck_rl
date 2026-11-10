@@ -70,7 +70,9 @@ def test_turn_button_generates_commands_and_returns_to_walking(playback, capsys)
     assert policy.behavior_mode is None
     assert policy.current_policy == "walking"
     assert policy.turn360 is None
-    assert "Turn360: success" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Turn360: success" in output
+    assert "Turn360 peaks: yaw=" in output
     np.testing.assert_array_equal(policy.command, np.zeros(13))
     np.testing.assert_allclose(policy.infer(), .01)
     # A second button press starts a fresh relative 360° goal.

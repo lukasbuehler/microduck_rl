@@ -20,8 +20,9 @@ def make_env(n=2):
         root_link_ang_vel_b=torch.zeros(n, 3),
         root_link_lin_vel_b=torch.zeros(n, 3),
         actuator_force=torch.zeros(n, 14),
+        joint_vel=torch.zeros(n, 14),
     )
-    scene = Scene(robot=SimpleNamespace(data=data))
+    scene = Scene(robot=SimpleNamespace(data=data, find_joints=lambda _: (list(range(14)), [])))
     scene.sensors = {
         name: SimpleNamespace(data=SimpleNamespace(found=torch.full((n, 2, 1), value)))
         for name, value in (("feet_ground_contact", 1.), ("turn_body_ground", 0.))
@@ -212,3 +213,30 @@ def test_cpu_playback_commands_and_success_match_training():
         assert bool(cmd.succeeded[0]) == (reason == "success")
         assert playback.angle == pytest.approx(float(cmd.angle[0]), abs=1e-6)
     assert reason == "success"
+
+
+def test_speed_costs_are_off_by_default_and_charge_only_excess():
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    data.joint_vel[:] = 10.
+    advance(env, cmd, math.degrees(0.12))  # 6 rad/s over a 20 ms step
+    assert mdp.turn360_reward(env, "yaw_speed").item() == 0
+    assert mdp.turn360_reward(env, "joint_speed").item() == 0
+    cmd.cfg.max_yaw_rate = 3.
+    cmd.cfg.max_joint_speed = 5.
+    assert mdp.turn360_reward(env, "yaw_speed").item() == pytest.approx(1., abs=1e-5)
+    assert mdp.turn360_reward(env, "joint_speed").item() == pytest.approx(1.)
+    data.joint_vel[:] = 4.
+    advance(env, cmd, math.degrees(0.14))  # 1 rad/s
+    assert mdp.turn360_reward(env, "yaw_speed").item() == 0
+    assert mdp.turn360_reward(env, "joint_speed").item() == 0
+    assert cmd.metrics["peak_yaw_rate_rad_s"].item() == pytest.approx(6., abs=1e-5)
+    assert cmd.metrics["peak_joint_speed_rad_s"].item() == 10.
+    cmd.reset(torch.tensor([0]))
+    assert cmd.metrics["peak_joint_speed_rad_s"].item() == 0
+
+
+@pytest.mark.parametrize("limit", [0., -1., math.inf, math.nan])
+def test_invalid_speed_limits_are_rejected(limit):
+    with pytest.raises(ValueError):
+        mdp.Turn360CommandCfg(resampling_time_range=(1e9, 1e9), max_yaw_rate=limit)

@@ -826,7 +826,7 @@ class PolicyInference:
                 dt if simulation_dt is None else simulation_dt,
                 self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7],
                 self.data.qvel[vad:vad + 3], self.data.qvel[vad + 3:vad + 6],
-                supported, body_contact,
+                supported, body_contact, joint_velocity=self.get_joint_vel(),
             )
             if reason:
                 print(f"Turn360: {reason}, rotation={math.degrees(self.turn360.angle):.1f}°")
@@ -840,6 +840,11 @@ class PolicyInference:
 
     def _end_behavior(self):
         name = self.behavior_mode
+        if self.turn360 is not None:
+            print(f"Turn360 peaks: yaw={self.turn360.peak_yaw_rate:.2f} rad/s "
+                  f"({math.degrees(self.turn360.peak_yaw_rate):.0f}°/s), "
+                  f"joint={self.turn360.peak_joint_speed:.2f} rad/s; "
+                  f"duration={self.turn360.elapsed:.2f}s")
         self.behavior_mode = None
         self.turn360 = None
         self.vel_cmd = np.zeros(3, dtype=np.float32)

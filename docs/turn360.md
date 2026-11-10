@@ -91,6 +91,41 @@ an episode early merely to escape running costs. The airborne tolerance allows
 brief contact-sensor gaps; it is not a license for a ballistic maneuver. Inspect
 videos as well as success metrics.
 
+## Optional speed-budget experiment
+
+The v1 policy has no yaw/joint speed budgets. After a CPU Turn360 attempt the
+runner prints peak yaw rate, peak servo joint speed (rad/s) and duration.
+Training also logs per-episode peaks to MLflow as
+`Metrics/twist/peak_yaw_rate_rad_s` and `peak_joint_speed_rad_s` (training charts
+average these episode peaks; they are not the maximum over the entire run).
+These measurements are at 50 Hz, so substep peaks can be higher.
+
+Two **training-only soft limits**, off by default, are configurable through:
+
+```text
+--env.commands.twist.max-yaw-rate 3.0
+--env.commands.twist.max-joint-speed 12.0
+```
+
+These numbers illustrate syntax; choose budgets from measured baseline rollouts,
+not as established actuator limits. A 3 rad/s yaw bound implies at least about
+2.1 s for a full revolution, before acceleration/braking/settling.
+
+Each cost is `max(abs(speed)/limit - 1, 0)^2`, weighted -1 per second. The joint
+cost averages over the 14 servo joints, excluding passive joints. Both costs
+are zero below the configured threshold. `None` disables each budget, preserving
+v1's objective. MLflow records thresholds, weights and component costs.
+
+For a controlled comparison, enable **one** budget in a fresh run with the same
+seed/environment count/iteration budget first. Keep the original checkpoint.
+The penalties encourage limits; they do not guarantee hard bounds. No policy
+output, motor torque or joint velocity is clamped during playback. Existing
+policies must be retrained to learn a new budget; the speed limit is not a
+runtime command input, and changing it does not retime an already trained ONNX.
+
+Speed budgets do not constrain the final joint pose. A neutral-pose objective or
+an acceleration/jerk cost would be separate experiments if flailing persists.
+
 ## Architecture and reproducibility
 
 - MDP state/rewards: the Turn360 section in `tasks/mdp.py`, following repo convention.

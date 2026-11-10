@@ -7736,6 +7736,7 @@ class Turn360Command(CommandTerm):
         self.drift = torch.zeros_like(self.angle)
         self.tilt = torch.zeros_like(self.angle)
         self.angular_speed = torch.zeros_like(self.angle)
+        self.yaw_rate = torch.zeros_like(self.angle)
         self.failed = torch.zeros_like(self.angle, dtype=torch.bool)
         self.succeeded = torch.zeros_like(self.failed)
         self._pending = torch.ones_like(self.failed)
@@ -7744,7 +7745,7 @@ class Turn360Command(CommandTerm):
         self.metrics = {
             name: torch.zeros_like(self.angle)
             for name in ("turns", "yaw_error_rad", "peak_drift_m", "peak_tilt_rad",
-                         "duration_s", "success")
+                         "duration_s", "success", "peak_yaw_rate_rad_s", "peak_joint_speed_rad_s")
         }
 
     @property
@@ -7753,7 +7754,7 @@ class Turn360Command(CommandTerm):
 
     def _resample_command(self, env_ids):
         for value in (self.angle, self.frontier, self.progress, self.elapsed,
-                      self.hold, self.air_time, self.drift, self.tilt):
+                      self.hold, self.air_time, self.drift, self.tilt, self.yaw_rate):
             value[env_ids] = 0.0
         self.failed[env_ids] = False
         self.succeeded[env_ids] = False
@@ -7787,6 +7788,7 @@ class Turn360Command(CommandTerm):
             active = ~pending
             dt = env.step_dt
             delta = wrap_to_pi(yaw - self.last_yaw)
+            self.yaw_rate = torch.where(active, delta / dt, 0.0)
             self.angle += torch.where(active, delta, 0.0)
             self.last_yaw.copy_(yaw)
             self.elapsed += active * dt
@@ -7826,6 +7828,10 @@ class Turn360Command(CommandTerm):
             self.metrics["peak_tilt_rad"] = torch.maximum(self.metrics["peak_tilt_rad"], self.tilt)
             self.metrics["duration_s"].copy_(self.elapsed)
             self.metrics["success"].copy_(self.succeeded.float())
+            joint_speed = _servo_joint_vel(env, env.scene["robot"]).abs().amax(dim=-1)
+            for name, speed in (("peak_yaw_rate_rad_s", self.yaw_rate.abs()),
+                                ("peak_joint_speed_rad_s", joint_speed)):
+                self.metrics[name] = torch.maximum(self.metrics[name], speed)
             self._last_step = int(env.common_step_counter)
 
         # Remaining signed turns plus body-frame displacement back to the origin.
@@ -7876,4 +7882,13 @@ def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
         return gate * cmd.angular_speed.square()
     if component == "effort":
         return env.scene["robot"].data.actuator_force.square().sum(-1)
+    if component == "yaw_speed":
+        if cmd.cfg.max_yaw_rate is None:
+            return torch.zeros_like(cmd.angle)
+        return (cmd.yaw_rate.abs() / cmd.cfg.max_yaw_rate - 1).clamp(min=0).square()
+    if component == "joint_speed":
+        if cmd.cfg.max_joint_speed is None:
+            return torch.zeros_like(cmd.angle)
+        velocity = _servo_joint_vel(env, env.scene["robot"])
+        return (velocity.abs() / cmd.cfg.max_joint_speed - 1).clamp(min=0).square().mean(-1)
     raise ValueError(f"Unknown Turn360 reward component: {component}")
