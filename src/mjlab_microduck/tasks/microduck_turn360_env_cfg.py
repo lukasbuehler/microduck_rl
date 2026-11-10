@@ -1,8 +1,8 @@
 """One counterclockwise revolution on feet, then a stable stop.
 
 The 61D layout is retained, but twist means [remaining turns, origin x/y in
-body frame / radius], NOT velocity. Use `play` for playback; the generic
-infer_policy.py runner does not generate these state-dependent commands.
+body frame / radius], NOT velocity. Use `play` or infer_policy.py's dedicated
+--turn360 slot, which generates these state-dependent commands.
 """
 
 import math
@@ -17,13 +17,14 @@ from mjlab_microduck.robot.microduck_constants import (
     get_allcollisions_spec,
 )
 from mjlab_microduck.tasks import mdp
+from mjlab_microduck.turn360 import TURN360_EPISODE_LENGTH_S
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
     MicroduckRlCfg,
     make_microduck_velocity_env_cfg,
 )
 
 
-EPISODE_LENGTH_S = 8.0
+EPISODE_LENGTH_S = TURN360_EPISODE_LENGTH_S
 ENABLE_VELOCITY_PUSHES = False
 
 

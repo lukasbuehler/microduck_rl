@@ -104,7 +104,8 @@ videos as well as success metrics.
   the success radius. Head/body command slots are zero. Remaining angle and
   displacement currently use simulator state; hardware would need an estimator.
 - Same observation size does **not** mean the standard runtime understands
-  these commands. Do not deploy this ONNX through generic velocity playback.
+  these commands. CPU playback has a dedicated `--turn360` slot; the onboard
+  runtime still needs a matching command generator before hardware deployment.
 
 `train-tracked` launches the unmodified trainer with TensorBoard logging and
 mirrors scalar events to MLflow, with CPU/RAM and (on NVIDIA Linux) GPU system
@@ -128,7 +129,7 @@ the code revision, seed, number of episodes and checkpoint when evaluating.
 
 ## Playback and videos
 
-Use the task's command generator, not `scripts/infer_policy.py`:
+To inspect the task alone, use its training command generator:
 
 ```bash
 uv run play Mjlab-Turn360-Flat-MicroDuck \
@@ -137,6 +138,34 @@ uv run play Mjlab-Turn360-Flat-MicroDuck \
 ```
 
 Use the actual checkpoint filename; these are examples, not guaranteed outputs.
+
+To trigger the learned spin alongside walking, use the ONNX automatically
+exported into the training run's directory (named after that directory):
+
+```bash
+uv run scripts/infer_policy.py \
+  --walking policies/velstand.onnx \
+  --turn360 "logs/rsl_rl/microduck_turn360/YOUR_RUN/YOUR_RUN.onnx" \
+  --new-cmd-obs
+```
+
+Press SPACE to stop, let the duck settle, then **I in the terminal** to start
+the spin. Walking/recovery takes over after the trained stable-finish condition,
+failure or eight-second simulation timeout. The next button press captures a
+fresh heading/origin. You can also add `--roulade policies/roulade.onnx` and use
+R for the existing roll. Turn360 defaults to the full-collision scene and uses
+projected gravity; it cannot run on the roller model.
+
+The CPU tracker shares goal thresholds with training and tests its command and
+completion calculations against the training implementation. It uses simulator
+pose/contact feedback, not a hardware estimator. Entry is restricted to settled,
+upright foot support; this is not yet a learned walking-to-spin transition.
+
+An arbitrary final head/leg configuration is currently allowed: success checks
+base orientation, rotation, drift and speed, not joint pose. The walking policy
+may bring it back toward its usual posture on handoff, but that transition needs
+rollout testing. A neutral finishing-pose reward would be a separate experiment.
+
 For periodic training videos, append `--video --video-interval 5000
 --video-length 200` to the training command. Video rendering adds overhead;
 leave it off for throughput comparisons. Videos are archived to MLflow at exit.

@@ -20,6 +20,7 @@ from mjlab.managers import CommandTermCfg, RewardTermCfg
 from mjlab.managers.event_manager import requires_model_fields
 from mjlab.utils.lab_api.math import matrix_from_quat, wrap_to_pi, quat_apply, quat_apply_inverse, quat_from_angle_axis
 from rsl_rl.algorithms.ppo import PPO as _PPO
+from mjlab_microduck.turn360 import Turn360Goal
 
 # ---------------------------------------------------------------------------
 # Patch 1: RewardManager.compute — sanitize NaN rewards before they enter the
@@ -7837,19 +7838,7 @@ class Turn360Command(CommandTerm):
 
 
 @_dataclass(kw_only=True)
-class Turn360CommandCfg(CommandTermCfg):
-    target_angle: float = 2 * math.pi
-    angle_tolerance: float = math.radians(10)
-    progress_tilt: float = math.radians(30)
-    success_tilt: float = math.radians(15)
-    failure_tilt: float = math.radians(45)
-    success_radius: float = 0.06
-    failure_radius: float = 0.20
-    stop_angular_speed: float = 0.3
-    stop_linear_speed: float = 0.05
-    hold_time: float = 0.3
-    max_air_time: float = 0.06
-
+class Turn360CommandCfg(Turn360Goal, CommandTermCfg):
     def build(self, env):
         return Turn360Command(self, env)
 

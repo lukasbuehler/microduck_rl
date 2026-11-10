@@ -192,3 +192,23 @@ def test_naming_anonymous_contacts_does_not_change_physics():
     for field in ("geom_pos", "geom_quat", "geom_size", "geom_friction", "geom_condim",
                   "geom_contype", "geom_conaffinity", "body_mass", "body_inertia"):
         np.testing.assert_array_equal(getattr(original, field), getattr(named, field))
+
+
+def test_cpu_playback_commands_and_success_match_training():
+    import numpy as np
+    from mjlab_microduck.turn360 import Turn360Playback
+
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    playback = Turn360Playback(data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy())
+    for angle in [70, 130, 190, 250, 310, 355, 360] + [360] * 16:
+        data.root_link_pos_w[:, 0] = 0.01
+        advance(env, cmd, angle)
+        reason = playback.update(
+            env.step_dt, data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy(),
+            data.root_link_lin_vel_b[0].numpy(), data.root_link_ang_vel_b[0].numpy(), True, False,
+        )
+        np.testing.assert_allclose(playback.command, cmd.command[0].numpy(), atol=1e-6)
+        assert bool(cmd.succeeded[0]) == (reason == "success")
+        assert playback.angle == pytest.approx(float(cmd.angle[0]), abs=1e-6)
+    assert reason == "success"

@@ -18,6 +18,7 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import onnxruntime as ort
+from mjlab_microduck.turn360 import TURN360_EPISODE_LENGTH_S, Turn360Goal, Turn360Playback
 
 MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
@@ -218,7 +219,7 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0):
+                 kick_duration=3.0, roulade_duration=2.0, turn360_onnx_path=None):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -321,10 +322,12 @@ class PolicyInference:
         self.behavior_durations = {}
         self.behavior_mode = None       # name of the running behavior, or None
         self.behavior_time_left = 0.0
+        self.turn360 = None
         for name, path, duration in (
             ("kick_left", kick_left_onnx_path, kick_duration),
             ("kick_right", kick_right_onnx_path, kick_duration),
             ("roulade", roulade_onnx_path, roulade_duration),
+            ("turn360", turn360_onnx_path, TURN360_EPISODE_LENGTH_S),
         ):
             if not path:
                 continue
@@ -335,6 +338,10 @@ class PolicyInference:
                 )
             print(f"\nLoading {name} policy from: {path}")
             self.behavior_sessions[name] = ort.InferenceSession(path)
+            if name == "turn360":
+                session = self.behavior_sessions[name]
+                if session.get_inputs()[0].shape != [1, 61] or session.get_outputs()[0].shape != [1, 14]:
+                    raise ValueError("--turn360 requires a normalized 61D -> 14D ONNX export")
             self.behavior_durations[name] = duration
             print(f"{name} policy input shape: {self.behavior_sessions[name].get_inputs()[0].shape}"
                   f"  (auto-return after {duration:.1f}s)")
@@ -368,6 +375,7 @@ class PolicyInference:
         # yaw frame) and optional ball freejoint (present in scene_ball.xml).
         _trunk_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
         self._trunk_qpos_adr = int(model.jnt_qposadr[_trunk_jid])
+        self._trunk_qvel_adr = int(model.jnt_dofadr[_trunk_jid])
         _ball_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "ball_free")
         if _ball_jid >= 0:
             self.ball_qpos_adr = int(model.jnt_qposadr[_ball_jid])
@@ -477,6 +485,8 @@ class PolicyInference:
                 # (twist ~0, head/body slots zero-padded) — feeding stale
                 # head/body commands would be out-of-distribution.
                 self.command = np.zeros(13, dtype=np.float32)
+                if self.behavior_mode == "turn360":
+                    self.command[:3] = self.turn360.command
                 return
             cmd = np.zeros(13, dtype=np.float32)
             # twist slot (or phase encoding for ground_pick — overwritten there)
@@ -752,6 +762,20 @@ class PolicyInference:
         if self.slope_mode:
             print(f"Cannot start {name} during slope mode")
             return
+        if name == "turn360":
+            goal = Turn360Goal()
+            velocity = self.data.qvel[self._trunk_qvel_adr:self._trunk_qvel_adr + 6]
+            if np.linalg.norm(self.vel_cmd) > 0.01 or np.linalg.norm(velocity[:3]) > goal.stop_linear_speed:
+                print("Stop walking (SPACE) and settle before starting Turn360")
+                return
+            adr = self._trunk_qpos_adr
+            quaternion = self.data.qpos[adr + 3:adr + 7]
+            tilt = math.acos(np.clip(1 - 2 * (quaternion[1]**2 + quaternion[2]**2), -1, 1))
+            supported, body_contact = self._turn360_contacts()
+            if tilt > goal.success_tilt or not supported or body_contact:
+                print("Stand upright on the feet before starting Turn360")
+                return
+            self.turn360 = Turn360Playback(self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7])
         if name in ("kick_left", "kick_right"):
             self._place_ball(name)
         self.behavior_mode = name
@@ -780,9 +804,35 @@ class PolicyInference:
         foot = behavior.split("_")[1]
         print(f"Ball placed at ({bx:.3f}, {by:.3f}) in front of the {foot} foot")
 
-    def update_behavior(self, dt: float):
+    def _turn360_contacts(self):
+        feet = {mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+                for name in ("left_foot_collision", "right_foot_collision")}
+        supported = body_contact = False
+        for contact in self.data.contact:
+            for robot_geom, other_geom in ((contact.geom1, contact.geom2), (contact.geom2, contact.geom1)):
+                if self.model.geom_bodyid[other_geom] == 0 and self.model.geom_bodyid[robot_geom] != 0:
+                    supported |= robot_geom in feet
+                    body_contact |= robot_geom not in feet
+        return supported, body_contact
+
+    def update_behavior(self, dt: float, simulation_dt=None):
         """Advance the behavior timer; hand back to walking/standing when done."""
         if self.behavior_mode is None:
+            return
+        if self.behavior_mode == "turn360":
+            adr, vad = self._trunk_qpos_adr, self._trunk_qvel_adr
+            supported, body_contact = self._turn360_contacts()
+            reason = self.turn360.update(
+                dt if simulation_dt is None else simulation_dt,
+                self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7],
+                self.data.qvel[vad:vad + 3], self.data.qvel[vad + 3:vad + 6],
+                supported, body_contact,
+            )
+            if reason:
+                print(f"Turn360: {reason}, rotation={math.degrees(self.turn360.angle):.1f}°")
+                self._end_behavior()
+            else:
+                self._update_command()
             return
         self.behavior_time_left -= dt
         if self.behavior_time_left <= 0.0:
@@ -791,6 +841,7 @@ class PolicyInference:
     def _end_behavior(self):
         name = self.behavior_mode
         self.behavior_mode = None
+        self.turn360 = None
         self.vel_cmd = np.zeros(3, dtype=np.float32)
         if self.walking_session:
             self.current_policy = "walking"
@@ -858,7 +909,9 @@ class PolicyInference:
         """Run policy inference and return action."""
         obs = self.get_observations()
         obs_batch = obs.reshape(1, -1)
-        action = self.ort_session.run([self.output_name], {self.input_name: obs_batch})[0]
+        input_name = self.ort_session.get_inputs()[0].name
+        output_name = self.ort_session.get_outputs()[0].name
+        action = self.ort_session.run([output_name], {input_name: obs_batch})[0]
         action = action.squeeze(0).astype(np.float32)
         self.last_action = action.copy()
         return action
@@ -1180,6 +1233,7 @@ def main():
     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
+    parser.add_argument("--turn360", type=str, default=None, help="Path to custom Turn360 ONNX (press I while standing); generates remaining-angle/origin commands and returns to walking on success, failure or timeout.")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
@@ -1236,10 +1290,14 @@ def main():
         parser.error("At least one of --walking, --standing or --sitstand must be provided")
     if args.sitstand and not args.new_cmd_obs:
         parser.error("--sitstand policies use the unified 13D command obs (61D); add --new-cmd-obs")
-    if (args.kick_left or args.kick_right or args.roulade) and not args.new_cmd_obs:
-        parser.error("--kick-left/--kick-right/--roulade policies use the unified 13D command obs (61D); add --new-cmd-obs")
-    if (args.kick_left or args.kick_right or args.roulade) and args.roller:
+    if (args.kick_left or args.kick_right or args.roulade or args.turn360) and not args.new_cmd_obs:
+        parser.error("behavior policies require --new-cmd-obs")
+    if (args.kick_left or args.kick_right or args.roulade or args.turn360) and args.roller:
         parser.error("kick/roulade policies are trained on the walking robot, not the roller model")
+    if args.turn360 and args.raw_accelerometer:
+        parser.error("--turn360 was trained with projected gravity; omit --raw-accelerometer")
+    if args.turn360 and (args.kick_left or args.kick_right) and not args.scene:
+        parser.error("Combining Turn360 and kicks needs an explicit full-collision scene with a ball (--scene)")
 
     # Parse delay arguments
     delay_min_lag = 0
@@ -1267,6 +1325,8 @@ def main():
         xml_path = MICRODUCK_ROLLERS_XML
     elif args.kick_left or args.kick_right:
         xml_path = MICRODUCK_BALL_XML
+    elif args.turn360:
+        xml_path = "src/mjlab_microduck/robot/microduck/scene_allcollisions.xml"
     else:
         xml_path = MICRODUCK_XML
     print(f"Loading MuJoCo model from: {xml_path}")
@@ -1342,6 +1402,7 @@ def main():
         roulade_onnx_path=args.roulade,
         kick_duration=args.kick_duration,
         roulade_duration=args.roulade_duration,
+        turn360_onnx_path=args.turn360,
     )
     policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 
@@ -1421,7 +1482,7 @@ def main():
         print(f"{kind} policy: loaded  (press Y to toggle)")
     if policy.slope_session:
         print(f"Slope policy: loaded  (press Y to toggle, passive descent)")
-    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R"}
+    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R", "turn360": "I"}
     for _name in policy.behavior_sessions:
         print(f"{_name} policy: loaded  (press {_behavior_keys[_name]}, "
               f"auto-return after {policy.behavior_durations[_name]:.1f}s)")
@@ -1557,6 +1618,8 @@ def main():
                 policy.trigger_behavior("kick_right")
             elif key == "r":
                 policy.trigger_behavior("roulade")
+            elif key == "i":
+                policy.trigger_behavior("turn360")
             elif key == "q":
                 quit_requested = True
                 print("Quit requested")
@@ -1624,6 +1687,7 @@ def main():
     print("  K:                kick with LEFT foot (requires --kick-left)")
     print("  L:                kick with RIGHT foot (requires --kick-right)")
     print("  R:                roulade / forward roll (requires --roulade)")
+    print("  I:                custom 360° turn, then return to walking (requires --turn360)")
     print(f"  P:                random push (trunk vel = {PUSH_MAX:.1f} m/s in random direction)")
     print("  Q:                quit")
     print("  [ Body pose mode — press B to toggle ]")
@@ -1677,7 +1741,8 @@ def main():
                 prev_step_time = step_start
 
                 policy.update_ground_pick_phase(actual_dt)
-                policy.update_behavior(actual_dt)
+                if policy_enabled or policy.behavior_mode != "turn360":
+                    policy.update_behavior(actual_dt, simulation_dt=model.opt.timestep * decimation)
 
                 if policy_enabled:
                     action = policy.infer()
