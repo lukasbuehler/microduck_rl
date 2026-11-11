@@ -1,4 +1,4 @@
-# One fast, stable 360° turn
+# One controlled, stable 360° turn
 
 Task: `Mjlab-Turn360-Flat-MicroDuck`. Start standing, turn counterclockwise once
 on the feet, stop near the starting point and hold for 0.3 s. No wheels, jumping,
@@ -47,103 +47,116 @@ uv run --extra tracking train-tracked --run-name turn360-v1-seed42 \
 Changing environment count also changes PPO batch size. Keep it fixed when
 comparing reward versions. Repeat promising comparisons across several seeds.
 
-## Reward
+## Reward: v3, complete the turn within a servo-speed budget
+
+There is no target yaw rate or prescribed duration. The eight-second deadline
+bounds an attempt; the servo-speed budget limits allowed motion. PPO's discount
+still favors earlier rewards, so this is not mathematically timing-neutral.
+The explicit time and remaining-angle running costs are removed.
 
 Let theta be signed, unwrapped yaw relative to reset, and
 `p_t = max(p_(t-1), clip(theta_t, 0, 2*pi))` on valid supported steps.
 
 ```text
-reward = 8 * (p_t - p_(t-1)) / (2*pi)
-       + 4 * success - 8 * failure
-       - dt * (0.05
-               + 0.5 * min(abs(2*pi - theta)/(2*pi), 2)
-               + 0.5 * sin(tilt)^2
+reward = 4 * delta_progress / (2*pi)
+       + 4 * first_reach_350_degrees
+       + 1 * stable_one_foot_delta_progress / (2*pi)
+       + 20 * success - 8 * (failure OR incomplete_deadline)
+       - dt * (0.5 * sin(tilt)^2
                + 0.2 * (distance_from_start / 0.06)^2
-               + 0.05 * braking_gate * angular_speed^2
+               + 0.1 * mean((joint_error / 0.5)^2)
+               + max((max_abs_servo_speed / 12 - 0.8) / 0.2, 0)^2
                + 0.001 * sum(actuator_torque^2))
-       + inherited roll/pitch-rate, action-rate and self-collision penalties
-       - dt * finish_gate * (0.5 * mean((joint_error / 0.25)^2)
-                             + 0.1 * mean((joint_velocity / 1.0)^2))
+       + roll/pitch-rate, action-rate and self-collision penalties
 ```
 
-`braking_gate` rises linearly from 0 at 270° to 1 at 360°. Progress only pays
-while at least one foot touches the floor, tilt is below 30°, and there is no
-failure. Backtracking cannot repay an already visited angle; spinning past 360°
-earns no further progress. Staying still earns nothing and incurs time/error
-costs. Unlike `completed_angle / elapsed_time` paid every step, old progress
-cannot be collected repeatedly. The frontier is a bounded progress signal, not
-a claim of policy-invariant potential shaping under PPO's discounting.
+Progress only pays while at least one foot touches the floor, tilt is below
+30 degrees, and there is no failure. Backtracking cannot repay visited angles;
+spinning beyond 360 degrees earns no more progress. The once-per-episode rotation
+bonus uses the same 10-degree tolerance as success. It does not require settling,
+so completion can be learned before the final stance. A 65% turn earns partial
+progress but no rotation bonus and no success bonus.
 
-mjlab multiplies rewards by `dt`, so progress and terminal functions divide by
-`dt` internally. Their weights are total payouts; other weights are per-second
-cost coefficients. Every component is logged separately. These weights are an
-initial hypothesis to evaluate, not established optimal values.
+The optional style preference adds at most one reward unit over a full turn.
+It pays only for new progress on exactly one foot, with tilt below 15 degrees
+and drift below 6 cm. Parking or rocking on one foot cannot farm it. Waddling
+still earns normal progress: the policy can discover either support strategy.
+Two-foot support is required only for the final standing hold.
+
+HOME regularization is gentle and constant throughout the episode, using a
+0.5 rad scale. The v2 angle-dependent pose, joint-motion and braking costs are
+removed: their growing costs near the finish likely contributed to stopping
+short, although the desktop observations do not isolate a single cause.
+The action-rate weight is reduced from -0.01 to -0.002 because its cost nearly
+matched the progress reward in v2. The budget handles excessive speed directly.
+No positive survival or standing reward is paid each step.
+
+mjlab multiplies rewards by dt. Progress and impulse functions divide by dt;
+the listed payouts are episode totals and the costs are per-second rates.
+The frontier is bounded shaping, not policy-invariant potential shaping.
+These weights are experimental hypotheses, not guarantees of convergence.
 
 Success requires all of the following for 0.3 continuous seconds:
 
-- Signed rotation within 10° of +360° (not heading modulo 360°).
-- Tilt below 15° and horizontal drift below 6 cm.
+- Signed rotation within 10 degrees of +360 degrees, not heading modulo 360.
+- Tilt below 15 degrees and horizontal drift below 6 cm.
 - Angular speed below 0.3 rad/s and linear speed below 0.05 m/s.
 - Both feet supported and no non-foot ground contact.
-- Every servo within 0.25 rad (about 14°) of its configured HOME joint position,
-  including all head/neck and leg joints.
+- Every servo within 0.25 rad (about 14 degrees) of configured HOME.
 - Every servo moving below 1.0 rad/s.
 
-The standing-finish experiment adds the last three requirements and the two
-finish costs above. `joint_error` is measured relative to the robot's configured
-`default_joint_pos`, not a sampled reset pose or a recorded walking pose.
-`finish_gate` rises from zero at 270° to one at 360°, like the braking gate.
-This leaves the earlier maneuver free to discover a gait and gives graded
-feedback during settling instead of only a binary success signal. Tolerances
-allow active balance corrections; they are initial experimental choices.
-Joint targets plus two-foot support constrain the stance without prescribing
-exact world-space foot locations. The existing base drift/heading checks remain.
+`joint_error` uses configured `default_joint_pos`, including all head and leg
+joints. Exact world-space foot positions are not prescribed. These tolerances
+allow balance corrections; their feasibility still needs learned-rollout tests.
 
-The CPU runner now applies these stricter finish checks to any Turn360 ONNX,
-including old exports; it does not modify their learned actions. Preserve the
-v1 checkpoint and code revision for comparisons with the original criteria.
+Failure ends the attempt on non-foot ground contact, tilt above 45 degrees,
+drift above 20 cm, invalid state, more than 60 ms airborne after the initial
+250 ms grace period, or any measured servo speed above its budget. The budget
+has no reset grace period. One grounded foot is sufficient during rotation.
 
-Failure ends the episode on non-foot ground contact, tilt above 45°, drift
-above 20 cm, invalid state, or over 60 ms airborne after a 250 ms reset grace
-period. Episodes time out at eight seconds. A failure penalty discourages ending
-an episode early merely to escape running costs. The airborne tolerance allows
-brief contact-sensor gaps; it is not a license for a ballistic maneuver. Inspect
-videos as well as success metrics.
+An unfinished eight-second attempt receives the same -8 failure payout.
+The deadline is a terminal task outcome, not a continuing-task truncation:
+PPO does not bootstrap beyond it. Success on the deadline takes precedence;
+a simultaneous physical failure receives only one failure payout.
 
-## Optional speed-budget experiment
+## Joint-speed budget
 
-The v1 policy has no yaw/joint speed budgets. After a CPU Turn360 attempt the
-runner prints peak yaw rate, peak servo joint speed (rad/s) and duration.
-Training also logs per-episode peaks to MLflow as
-`Metrics/twist/peak_yaw_rate_rad_s` and `peak_joint_speed_rad_s` (training charts
-average these episode peaks; they are not the maximum over the entire run).
-These measurements are at 50 Hz, so substep peaks can be higher.
-
-Two **training-only soft limits**, off by default, are configurable through:
+The v3 default is **12 rad/s per servo**, configurable in training:
 
 ```text
---env.commands.twist.max-yaw-rate 3.0
 --env.commands.twist.max-joint-speed 12.0
 ```
 
-These numbers illustrate syntax; choose budgets from measured baseline rollouts,
-not as established actuator limits. A 3 rad/s yaw bound implies at least about
-2.1 s for a full revolution, before acceleration/braking/settling.
+This is a first experimental choice informed by earlier v1 CPU peaks around
+12 rad/s. Checkpoint 100's speed was not measured, and this is not a validated
+hardware limit. A larger budget can be chosen if exploration is completely
+blocked, but record it as a distinct experiment.
 
-Each cost is `max(abs(speed)/limit - 1, 0)^2`, weighted -1 per second. The joint
-cost averages over the 14 servo joints, excluding passive joints. Both costs
-are zero below the configured threshold. `None` disables the corresponding
-speed cost. MLflow records thresholds, weights and component costs.
+The worst servo, not the average across joints, determines both the soft cost
+and violation. The soft cost starts at 80% of the budget (9.6 rad/s by default),
+is one at the budget, and any value strictly above the budget fails the attempt
+and blocks progress/completion rewards on that step. Passive joints are excluded.
+Setting the optional budget to None disables both the speed cost and its failure
+check. No yaw-speed budget is enabled; the optional `max-yaw-rate` remains a
+training-only soft excess cost if explicitly configured.
 
-For a controlled comparison, enable **one** budget in a fresh run with the same
-seed/environment count/iteration budget first. Keep the original checkpoint.
-The penalties encourage limits; they do not guarantee hard bounds. No policy
-output, motor torque or joint velocity is clamped during playback. Existing
-policies must be retrained to learn a new budget; the speed limit is not a
-runtime command input, and changing it does not retime an already trained ONNX.
+The check uses measured velocity at 50 Hz. Substep peaks can be higher, and a
+failed attempt has already exceeded the budget. **This is an episode constraint,
+not a hard physical speed clamp or hardware safety guarantee.** CPU playback
+hands back to walking on a violation and does not clamp actions, torque or speed.
+A real motor-speed guarantee requires a matching lower-level controller.
 
-Speed budgets do not constrain the final joint pose. Keep them disabled for the
-standing-finish experiment to isolate the change in the landing objective.
+The CPU runner defaults to the same 12 rad/s budget. For a different trained
+budget, pass `--turn360-max-joint-speed VALUE` to `scripts/infer_policy.py`.
+The runner applies current success/failure checks even to older ONNX files;
+use the original code revision for an unchanged historical evaluation.
+
+MLflow logs mean per-episode peak yaw/joint speeds, not the maximum across a run.
+It also logs `rotation_completed`, `joint_speed_violation`, `timeout`, and
+`finish_angle_ok`, `finish_pose_ok`, `finish_motion_ok`, `finish_support_ok` under
+`Metrics/twist/`. The finish flags describe episode-end conditions, not a
+continuous 0.3-second hold. They help distinguish partial turns, stance failures
+and speed violations rather than interpreting zero success alone.
 
 ## Architecture and reproducibility
 
@@ -220,28 +233,38 @@ still finish in an arbitrary head/leg configuration and fail the new criteria.
 The walking handoff still needs rollout testing with the newly trained policy.
 Entry while walking is deliberately blocked because training starts at rest.
 
-### Standing-finish experiment: next desktop check
+### v3 experiment: next desktop check
 
-First run the required five-iteration CUDA smoke test with the new objective:
+Pull branch `lukas`, then run the required five-iteration CUDA smoke test:
 
 ```bash
-uv run --extra tracking train-tracked --run-name turn360-standing-smoke \
+git pull --ff-only origin lukas
+uv run --extra tracking train-tracked --run-name turn360-budget-v3-smoke \
   Mjlab-Turn360-Flat-MicroDuck \
   --env.scene.num-envs 64 --agent.max-iterations 5 --agent.seed 42
 ```
 
-After it passes, use a fresh run named `turn360-standing-v2-seed42` with the
-same 1024 environments, seed 42 and 1000 iterations as v1. Do not initialize
-from v1 for this first controlled comparison. Finish error/speed are logged as
-`Metrics/twist/finish_joint_error_rad` and `finish_joint_speed_rad_s`; these
-measure the largest absolute servo error/speed at the episode end, averaged
-across episodes, rather than peaks over the maneuver.
+After it passes, a fresh comparison run uses 2048 environments (matching the
+actual v2 run), seed 42 and 1000 iterations:
 
-The first v1 combined-runner measurements failed after 0.16 s at 62–73°,
-with peak yaw rates 11.35–12.84 rad/s and joint speeds 11.78–12.28 rad/s.
-These were early posture/contact failures, not successful full turns followed
-by a bad handoff. The runner now distinguishes non-foot contact, tilt and drift
-failures. A finish reward alone is not evidence that this early failure is fixed.
+```bash
+uv run --extra tracking train-tracked --run-name turn360-budget-v3-seed42 \
+  Mjlab-Turn360-Flat-MicroDuck \
+  --env.scene.num-envs 2048 --agent.max-iterations 1000 --agent.seed 42
+```
+
+Preserve v2 checkpoint 100 as the preferred qualitative motion baseline. Its
+observed rotation was still only about 65%, not a full success. The final v2
+checkpoint degraded to an awkward partial turn, with zero logged successes.
+Inspect checkpoints during learning rather than assuming the last is best.
+Multiple reward/constraint changes make v3 a revised objective, not an isolated
+single-factor ablation. CPU tests do not establish CUDA execution or behavior.
+
+The first v1 combined-runner measurements failed after 0.16 s at 62-73 degrees,
+with peak yaw rates 11.35-12.84 rad/s and joint speeds 11.78-12.28 rad/s. These
+were early posture/contact failures. The runner distinguishes non-foot contact,
+tilt, drift and speed failures; none of these unit tests proves the learned
+walking handoff works.
 
 For periodic training videos, append `--video --video-interval 5000
 --video-length 200` to the training command. Video rendering adds overhead;

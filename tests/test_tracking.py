@@ -59,7 +59,8 @@ def test_live_bridge_logs_new_events_once_and_resolved_params(tmp_path):
     from dataclasses import asdict
     from mjlab.utils.os import dump_yaml
     from mjlab_microduck.tasks.microduck_turn360_env_cfg import make_microduck_turn360_env_cfg
-    dump_yaml(directory / "params/env.yaml", asdict(make_microduck_turn360_env_cfg()))
+    env_cfg = make_microduck_turn360_env_cfg()
+    dump_yaml(directory / "params/env.yaml", asdict(env_cfg))
     writer = SummaryWriter(str(directory))
     writer.add_scalar("Episode_Reward/turn_progress", 0.25, 1)
     writer.flush()
@@ -73,7 +74,10 @@ def test_live_bridge_logs_new_events_once_and_resolved_params(tmp_path):
     assert [(m.step, m.value) for m in history] == [(1, 0.25), (2, 0.5)]
     assert client.get_run(run_id).data.params["agent.seed"] == "42"
     assert client.get_run(run_id).data.params["agent.algorithm.learning_rate"] == "0.001"
-    assert client.get_run(run_id).data.params["env.rewards.turn_progress.weight"] == "8.0"
+    params = client.get_run(run_id).data.params
+    assert params["env.rewards.turn_progress.weight"] == str(env_cfg.rewards["turn_progress"].weight)
+    assert params["env.commands.twist.max_joint_speed"] == "12.0"
+    assert params["env.rewards.turn_success.weight"] == "20.0"
     joint_key = "env.scene.terrain.init_state.joint_pos"
     assert ".*" in client.get_run(run_id).data.params[joint_key]
     assert client.list_artifacts(run_id, "params")[0].path == "params/agent.yaml"

@@ -20,7 +20,7 @@ from mjlab.managers import CommandTermCfg, RewardTermCfg
 from mjlab.managers.event_manager import requires_model_fields
 from mjlab.utils.lab_api.math import matrix_from_quat, wrap_to_pi, quat_apply, quat_apply_inverse, quat_from_angle_axis
 from rsl_rl.algorithms.ppo import PPO as _PPO
-from mjlab_microduck.turn360 import Turn360Goal
+from mjlab_microduck.turn360 import TURN360_EPISODE_LENGTH_S, Turn360Goal
 
 # ---------------------------------------------------------------------------
 # Patch 1: RewardManager.compute — sanitize NaN rewards before they enter the
@@ -7741,6 +7741,10 @@ class Turn360Command(CommandTerm):
         self.joint_velocity = torch.zeros_like(self.pose_error)
         self.failed = torch.zeros_like(self.angle, dtype=torch.bool)
         self.succeeded = torch.zeros_like(self.failed)
+        self.timed_out = torch.zeros_like(self.failed)
+        self.rotation_completed = torch.zeros_like(self.failed)
+        self.completion = torch.zeros_like(self.failed)
+        self.pirouette_progress = torch.zeros_like(self.angle)
         self._pending = torch.ones_like(self.failed)
         self._needs_reset_capture = True
         self._last_step = -1
@@ -7748,7 +7752,9 @@ class Turn360Command(CommandTerm):
             name: torch.zeros_like(self.angle)
             for name in ("turns", "yaw_error_rad", "peak_drift_m", "peak_tilt_rad",
                          "duration_s", "success", "peak_yaw_rate_rad_s", "peak_joint_speed_rad_s",
-                         "finish_joint_error_rad", "finish_joint_speed_rad_s")
+                         "finish_joint_error_rad", "finish_joint_speed_rad_s",
+                         "rotation_completed", "joint_speed_violation", "timeout",
+                         "finish_angle_ok", "finish_pose_ok", "finish_motion_ok", "finish_support_ok")
         }
 
     @property
@@ -7761,6 +7767,10 @@ class Turn360Command(CommandTerm):
             value[env_ids] = 0.0
         self.failed[env_ids] = False
         self.succeeded[env_ids] = False
+        self.timed_out[env_ids] = False
+        self.rotation_completed[env_ids] = False
+        self.completion[env_ids] = False
+        self.pirouette_progress[env_ids] = 0.0
         self._pending[env_ids] = True
         self._needs_reset_capture = True
         self._command[env_ids] = 0.0
@@ -7804,15 +7814,20 @@ class Turn360Command(CommandTerm):
             if supported is None or body_contact is None:
                 raise RuntimeError("Turn360 requires feet and non-foot ground-contact sensors")
             feet = env.scene.sensors["feet_ground_contact"].data.found
-            both_feet = (feet.reshape(self.num_envs, 2, -1) > 0).any(-1).all(-1)
+            foot_count = (feet.reshape(self.num_envs, 2, -1) > 0).any(-1).sum(-1)
+            both_feet = foot_count == 2
             robot = env.scene["robot"]
             self.pose_error = _servo_joint_pos(env, robot) - _servo_default_joint_pos(env, robot)
             self.joint_velocity = _servo_joint_vel(env, robot)
             self.air_time = torch.where(supported, 0.0, self.air_time + active * dt)
             finite = torch.isfinite(torch.cat((q, xy, data.root_link_ang_vel_b,
-                                               data.root_link_lin_vel_b), dim=-1)).all(-1)
+                                               data.root_link_lin_vel_b, self.pose_error,
+                                               self.joint_velocity), dim=-1)).all(-1)
+            joint_speed = self.joint_velocity.abs().amax(-1)
+            speed_violation = (joint_speed > self.cfg.max_joint_speed
+                               if self.cfg.max_joint_speed is not None else torch.zeros_like(active))
             self.failed = active & (
-                ~finite | body_contact | (self.tilt > self.cfg.failure_tilt)
+                ~finite | body_contact | speed_violation | (self.tilt > self.cfg.failure_tilt)
                 | (self.drift > self.cfg.failure_radius)
                 | ((self.elapsed > 0.25) & (self.air_time > self.cfg.max_air_time))
             )
@@ -7821,18 +7836,30 @@ class Turn360Command(CommandTerm):
             frontier = torch.where(valid, torch.maximum(self.frontier, candidate), self.frontier)
             self.progress = frontier - self.frontier
             self.frontier = frontier
+            reached = valid & (self.frontier >= self.cfg.target_angle - self.cfg.angle_tolerance)
+            self.completion = reached & ~self.rotation_completed
+            self.rotation_completed |= reached
+            # A style preference attached to new progress cannot pay for parking
+            # on one foot. Both support styles receive the ordinary progress reward.
+            pirouette = ((foot_count == 1) & (self.tilt < self.cfg.success_tilt)
+                         & (self.drift < self.cfg.success_radius))
+            self.pirouette_progress = self.progress * pirouette
             near_goal = (self.angle - self.cfg.target_angle).abs() < self.cfg.angle_tolerance
+            pose_ok = self.pose_error.abs().amax(-1) < self.cfg.finish_joint_tolerance
+            motion_ok = ((self.angular_speed < self.cfg.stop_angular_speed)
+                         & (linear_speed < self.cfg.stop_linear_speed)
+                         & (joint_speed < self.cfg.finish_joint_speed))
             stable = (
                 valid & near_goal & (self.frontier >= self.cfg.target_angle - self.cfg.angle_tolerance)
                 & (self.tilt < self.cfg.success_tilt) & (self.drift < self.cfg.success_radius)
-                & (self.angular_speed < self.cfg.stop_angular_speed)
-                & (linear_speed < self.cfg.stop_linear_speed)
-                & both_feet
-                & (self.pose_error.abs().amax(-1) < self.cfg.finish_joint_tolerance)
-                & (self.joint_velocity.abs().amax(-1) < self.cfg.finish_joint_speed)
+                & both_feet & pose_ok & motion_ok
             )
             self.hold = torch.where(stable, self.hold + active * dt, 0.0)
             self.succeeded = stable & (self.hold >= self.cfg.hold_time)
+            deadline = (env.episode_length_buf >= env.max_episode_length
+                        if hasattr(env, "episode_length_buf")
+                        else self.elapsed >= TURN360_EPISODE_LENGTH_S)
+            self.timed_out = active & deadline & ~self.succeeded & ~self.failed
             self.metrics["turns"].copy_(self.angle / (2 * math.pi))
             self.metrics["yaw_error_rad"].copy_((self.cfg.target_angle - self.angle).abs())
             self.metrics["peak_drift_m"] = torch.maximum(self.metrics["peak_drift_m"], self.drift)
@@ -7841,7 +7868,11 @@ class Turn360Command(CommandTerm):
             self.metrics["success"].copy_(self.succeeded.float())
             self.metrics["finish_joint_error_rad"].copy_(self.pose_error.abs().amax(-1))
             self.metrics["finish_joint_speed_rad_s"].copy_(self.joint_velocity.abs().amax(-1))
-            joint_speed = _servo_joint_vel(env, env.scene["robot"]).abs().amax(dim=-1)
+            for name, value in (("rotation_completed", self.rotation_completed),
+                                ("joint_speed_violation", speed_violation), ("timeout", self.timed_out),
+                                ("finish_angle_ok", near_goal), ("finish_pose_ok", pose_ok),
+                                ("finish_motion_ok", motion_ok), ("finish_support_ok", both_feet)):
+                self.metrics[name].copy_(value.float())
             for name, speed in (("peak_yaw_rate_rad_s", self.yaw_rate.abs()),
                                 ("peak_joint_speed_rad_s", joint_speed)):
                 self.metrics[name] = torch.maximum(self.metrics[name], speed)
@@ -7868,6 +7899,12 @@ def turn360_done(env: ManagerBasedRlEnv, success: bool) -> torch.Tensor:
     return command.succeeded if success else command.failed
 
 
+def turn360_timeout(env: ManagerBasedRlEnv) -> torch.Tensor:
+    command = env.command_manager.get_term("twist")
+    command.update()
+    return command.timed_out
+
+
 def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
     """Separate logged terms. mjlab multiplies all rewards by step_dt.
 
@@ -7878,27 +7915,21 @@ def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
     cmd.update()
     if component == "progress":
         return cmd.progress / cmd.cfg.target_angle / env.step_dt
+    if component == "completion":
+        return cmd.completion.float() / env.step_dt
+    if component == "pirouette":
+        return cmd.pirouette_progress / cmd.cfg.target_angle / env.step_dt
     if component == "success":
         return cmd.succeeded.float() / env.step_dt
     if component == "failure":
-        return cmd.failed.float() / env.step_dt
-    if component == "time":
-        return torch.ones_like(cmd.angle)
-    if component == "remaining":
-        return ((cmd.cfg.target_angle - cmd.angle).abs() / cmd.cfg.target_angle).clamp(max=2)
+        return (cmd.failed | cmd.timed_out).float() / env.step_dt
     if component == "tilt":
         return torch.sin(cmd.tilt).square()
     if component == "drift":
         return (cmd.drift / cmd.cfg.success_radius).square()
-    if component == "braking":
-        gate = ((cmd.angle / cmd.cfg.target_angle - 0.75) / 0.25).clamp(0, 1)
-        return gate * cmd.angular_speed.square()
-    if component in ("finish_pose", "finish_motion"):
-        # Only tax the return to standing in the final quarter of the turn.
-        gate = ((cmd.angle / cmd.cfg.target_angle - 0.75) / 0.25).clamp(0, 1)
-        error = (cmd.pose_error / cmd.cfg.finish_joint_tolerance if component == "finish_pose"
-                 else cmd.joint_velocity / cmd.cfg.finish_joint_speed)
-        return gate * error.square().mean(-1)
+    if component == "finish_pose":
+        # Gentle, fixed target throughout: no angle-dependent cost barrier.
+        return (cmd.pose_error / cmd.cfg.pose_scale).square().mean(-1)
     if component == "effort":
         return env.scene["robot"].data.actuator_force.square().sum(-1)
     if component == "yaw_speed":
@@ -7909,5 +7940,6 @@ def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
         if cmd.cfg.max_joint_speed is None:
             return torch.zeros_like(cmd.angle)
         velocity = _servo_joint_vel(env, env.scene["robot"])
-        return (velocity.abs() / cmd.cfg.max_joint_speed - 1).clamp(min=0).square().mean(-1)
+        # Price the worst servo approaching its budget; averaging hid spikes.
+        return ((velocity.abs().amax(-1) / cmd.cfg.max_joint_speed - 0.8) / 0.2).clamp(min=0).square()
     raise ValueError(f"Unknown Turn360 reward component: {component}")

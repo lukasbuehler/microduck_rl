@@ -93,33 +93,34 @@ def make_microduck_turn360_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         for name in ("body_ang_vel", "action_rate_l2", "self_collisions")
     }
     cfg.rewards["body_ang_vel"].weight = -0.05  # roll/pitch rates only
-    cfg.rewards["action_rate_l2"].weight = -0.01
+    cfg.rewards["action_rate_l2"].weight = -0.002
     # Functions return nonnegative costs or reward rates; signs live here.
     for name, weight in {
-        "progress": 8.0,
-        "success": 4.0,
+        "progress": 4.0,
+        "completion": 4.0,
+        "pirouette": 1.0,
+        "success": 20.0,
         "failure": -8.0,
-        "time": -0.05,
-        "remaining": -0.5,
         "tilt": -0.5,
         "drift": -0.2,
-        "braking": -0.05,
         "effort": -0.001,
         "yaw_speed": -1.0,
         "joint_speed": -1.0,
-        "finish_pose": -0.5,
-        "finish_motion": -0.1,
+        "finish_pose": -0.1,
     }.items():
         cfg.rewards[f"turn_{name}"] = RewardTermCfg(
             func=mdp.turn360_reward, weight=weight, params={"component": name},
         )
     cfg.terminations = {
-        name: cfg.terminations[name] for name in ("time_out", "nan_state")
+        name: cfg.terminations[name] for name in ("nan_state",)
     }
     for name in ("success", "failure"):
         cfg.terminations[f"turn_{name}"] = TerminationTermCfg(
             func=mdp.turn360_done, params={"success": name == "success"},
         )
+    # This is a finite task deadline, not a truncated continuing episode:
+    # timeout is penalized and must not bootstrap a hypothetical future finish.
+    cfg.terminations["turn_timeout"] = TerminationTermCfg(func=mdp.turn360_timeout)
     if play:
         cfg.observations["actor"].enable_corruption = False
     return cfg

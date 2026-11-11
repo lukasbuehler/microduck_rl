@@ -161,6 +161,14 @@ def test_cfg_preserves_layout_and_has_real_body_contacts():
         assert "track_angular_velocity" not in cfg.rewards
         assert "angular_momentum" not in cfg.rewards
         assert cfg.commands["twist"].target_angle == 2 * math.pi
+        assert cfg.commands["twist"].max_joint_speed == 12.
+        assert cfg.commands["twist"].max_yaw_rate is None
+        assert cfg.rewards["turn_success"].weight > cfg.rewards["turn_progress"].weight
+        assert "turn_braking" not in cfg.rewards
+        assert "turn_finish_motion" not in cfg.rewards
+        assert "turn_time" not in cfg.rewards
+        assert "time_out" not in cfg.terminations
+        assert not cfg.terminations["turn_timeout"].time_out
         spec = cfg.scene.entities["robot"].spec_fn()
         model = spec.compile()
         assert model.nu == 14
@@ -219,8 +227,9 @@ def test_cpu_playback_commands_and_success_match_training():
     assert reason == "success"
 
 
-def test_speed_costs_are_off_by_default_and_charge_only_excess():
+def test_speed_costs_can_be_disabled_and_servo_cost_prices_worst_joint_near_budget():
     env, cmd = make_env(n=1)
+    cmd.cfg.max_joint_speed = None
     data = env.scene["robot"].data
     data.joint_vel[:] = 10.
     advance(env, cmd, math.degrees(0.12))  # 6 rad/s over a 20 ms step
@@ -229,7 +238,7 @@ def test_speed_costs_are_off_by_default_and_charge_only_excess():
     cmd.cfg.max_yaw_rate = 3.
     cmd.cfg.max_joint_speed = 5.
     assert mdp.turn360_reward(env, "yaw_speed").item() == pytest.approx(1., abs=1e-5)
-    assert mdp.turn360_reward(env, "joint_speed").item() == pytest.approx(1.)
+    assert mdp.turn360_reward(env, "joint_speed").item() == pytest.approx(36.)
     data.joint_vel[:] = 4.
     advance(env, cmd, math.degrees(0.14))  # 1 rad/s
     assert mdp.turn360_reward(env, "yaw_speed").item() == 0
@@ -246,7 +255,7 @@ def test_invalid_speed_limits_are_rejected(limit):
         mdp.Turn360CommandCfg(resampling_time_range=(1e9, 1e9), max_yaw_rate=limit)
 
 
-@pytest.mark.parametrize("name", ["finish_joint_tolerance", "finish_joint_speed"])
+@pytest.mark.parametrize("name", ["finish_joint_tolerance", "finish_joint_speed", "pose_scale"])
 @pytest.mark.parametrize("value", [None, 0., -1., math.inf, math.nan])
 def test_invalid_finish_thresholds_are_rejected(name, value):
     from mjlab_microduck.turn360 import Turn360Goal
@@ -291,15 +300,92 @@ def test_finish_requires_home_pose_slow_joints_and_both_feet_in_training_and_pla
     assert step(360) == "success"
 
 
-def test_finish_costs_only_apply_near_end_and_measure_configured_pose():
+def test_home_cost_is_gentle_and_does_not_ramp_with_turn_angle():
     env, cmd = make_env(n=1)
     data = env.scene["robot"].data
     data.joint_pos += cmd.cfg.finish_joint_tolerance
     data.joint_vel[:] = cmd.cfg.finish_joint_speed
-    for angle in [90, 180, 270]:
+    for angle in [0, 90, 180, 270, 360]:
         advance(env, cmd, angle)
-        assert mdp.turn360_reward(env, "finish_pose").item() == 0.
-        assert mdp.turn360_reward(env, "finish_motion").item() == 0.
-    advance(env, cmd, 360)
-    assert mdp.turn360_reward(env, "finish_pose").item() == pytest.approx(1.)
-    assert mdp.turn360_reward(env, "finish_motion").item() == pytest.approx(1.)
+        assert mdp.turn360_reward(env, "finish_pose").item() == pytest.approx(0.25)
+
+
+def test_completion_pays_once_and_partial_turn_has_no_completion_bonus():
+    env, cmd = make_env(n=1)
+    for angle in [90, 180, 234, 270, 340]:
+        advance(env, cmd, angle)
+        assert mdp.turn360_reward(env, "completion").item() == 0.
+    advance(env, cmd, 355)
+    assert mdp.turn360_reward(env, "completion").item() * env.step_dt == pytest.approx(1.)
+    for angle in [360, 355, 340, 355, 360]:
+        advance(env, cmd, angle)
+        assert mdp.turn360_reward(env, "completion").item() == 0.
+    cmd.reset(torch.tensor([0]))
+    assert not cmd.rotation_completed.any()
+
+
+@pytest.mark.parametrize("tilt,drift,feet,earns_bonus", [
+    (0., 0., 1, True), (20., 0., 1, False), (0., 0.1, 1, False), (0., 0., 2, False),
+])
+def test_pirouette_bonus_only_pays_for_new_stable_one_foot_progress(tilt, drift, feet, earns_bonus):
+    env, cmd = make_env(n=1)
+    env.scene.sensors["feet_ground_contact"].data.found[:, 1] = float(feet == 2)
+    env.scene["robot"].data.root_link_pos_w[:, 0] = drift
+    advance(env, cmd, 90, tilt=tilt)
+    assert not cmd.failed.any()  # one foot is valid support during the maneuver
+    bonus = mdp.turn360_reward(env, "pirouette").item() * env.step_dt
+    assert bonus == pytest.approx(0.25 if earns_bonus else 0.)
+    assert mdp.turn360_reward(env, "progress").item() > 0.
+    for angle in [90, 60, 90]:
+        advance(env, cmd, angle, tilt=tilt)
+        assert mdp.turn360_reward(env, "pirouette").item() == 0.
+
+
+@pytest.mark.parametrize("speed,fails", [(9., False), (12., False), (12.01, True)])
+def test_one_servo_exceeding_budget_fails_training_and_playback(speed, fails):
+    from mjlab_microduck.turn360 import Turn360Playback
+
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    playback = Turn360Playback(data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy())
+    data.joint_vel[0, 6] = -speed
+    advance(env, cmd, 30)
+    reason = playback.update(
+        env.step_dt, data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy(),
+        data.root_link_lin_vel_b[0].numpy(), data.root_link_ang_vel_b[0].numpy(), True, False,
+        joint_velocity=data.joint_vel[0].numpy(),
+    )
+    assert bool(cmd.failed[0]) == fails
+    assert (reason is not None and "joint-speed" in reason) == fails
+    if fails:
+        assert cmd.progress.item() == 0.
+        assert cmd.metrics["joint_speed_violation"].item() == 1.
+    if speed == 12.:
+        assert mdp.turn360_reward(env, "joint_speed").item() == pytest.approx(1.)
+
+
+def test_partial_turn_at_deadline_is_penalized_terminal_failure_not_bootstrapped_timeout():
+    env, cmd = make_env(n=2)
+    env.episode_length_buf = torch.tensor([400, 399])
+    env.max_episode_length = 400
+    advance(env, cmd, 234)
+    assert torch.equal(mdp.turn360_timeout(env), torch.tensor([True, False]))
+    assert mdp.turn360_reward(env, "failure")[0].item() * env.step_dt == pytest.approx(1.)
+    assert not cmd.succeeded.any()
+    assert not cmd.rotation_completed.any()
+    assert not cmd.failed.any()  # separate physical failure / incomplete deadline diagnostics
+
+
+def test_passive_joint_speed_does_not_affect_budget_or_pose_cost():
+    env, cmd = make_env(n=1)
+    robot = env.scene["robot"]
+    robot.find_joints = lambda _: (list(range(0, 28, 2)), [])
+    env._servo_joint_ids_cache.clear()
+    for name in ("joint_vel", "joint_pos", "default_joint_pos"):
+        setattr(robot.data, name, torch.zeros(1, 28))
+    robot.data.joint_vel[:, 1::2] = 1000.
+    robot.data.joint_pos[:, 1::2] = 10.
+    advance(env, cmd, 90)
+    assert not cmd.failed.any()
+    assert mdp.turn360_reward(env, "joint_speed").item() == 0.
+    assert mdp.turn360_reward(env, "finish_pose").item() == 0.

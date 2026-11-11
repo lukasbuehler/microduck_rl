@@ -219,7 +219,8 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0, turn360_onnx_path=None):
+                 kick_duration=3.0, roulade_duration=2.0, turn360_onnx_path=None,
+                 turn360_max_joint_speed=Turn360Goal().max_joint_speed):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -323,6 +324,7 @@ class PolicyInference:
         self.behavior_mode = None       # name of the running behavior, or None
         self.behavior_time_left = 0.0
         self.turn360 = None
+        self.turn360_goal = Turn360Goal(max_joint_speed=turn360_max_joint_speed)
         for name, path, duration in (
             ("kick_left", kick_left_onnx_path, kick_duration),
             ("kick_right", kick_right_onnx_path, kick_duration),
@@ -763,7 +765,7 @@ class PolicyInference:
             print(f"Cannot start {name} during slope mode")
             return
         if name == "turn360":
-            goal = Turn360Goal()
+            goal = self.turn360_goal
             velocity = self.data.qvel[self._trunk_qvel_adr:self._trunk_qvel_adr + 6]
             if np.linalg.norm(self.vel_cmd) > 0.01 or np.linalg.norm(velocity[:3]) > goal.stop_linear_speed:
                 print("Stop walking (SPACE) and settle before starting Turn360")
@@ -775,7 +777,7 @@ class PolicyInference:
             if tilt > goal.success_tilt or not supported or body_contact:
                 print("Stand upright on the feet before starting Turn360")
                 return
-            self.turn360 = Turn360Playback(self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7])
+            self.turn360 = Turn360Playback(self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7], goal=goal)
         if name in ("kick_left", "kick_right"):
             self._place_ball(name)
         self.behavior_mode = name
@@ -1242,6 +1244,8 @@ def main():
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
     parser.add_argument("--turn360", type=str, default=None, help="Path to custom Turn360 ONNX (press I while standing); generates remaining-angle/origin commands and returns to walking on success, failure or timeout.")
+    parser.add_argument("--turn360-max-joint-speed", type=float, default=Turn360Goal().max_joint_speed,
+                        help="Turn360 servo-speed failure budget in rad/s; match training (default: %(default)s). Does not clamp motor speeds.")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
@@ -1411,6 +1415,7 @@ def main():
         kick_duration=args.kick_duration,
         roulade_duration=args.roulade_duration,
         turn360_onnx_path=args.turn360,
+        turn360_max_joint_speed=args.turn360_max_joint_speed,
     )
     policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 

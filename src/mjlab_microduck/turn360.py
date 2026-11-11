@@ -24,12 +24,13 @@ class Turn360Goal:
     max_air_time: float = 0.06
     finish_joint_tolerance: float = 0.25  # rad, every servo relative to HOME
     finish_joint_speed: float = 1.0  # rad/s, every servo
-    # Training-only soft limits. None disables these speed costs.
+    # No yaw pace target. The servo budget is checked at control steps.
     max_yaw_rate: float | None = None
-    max_joint_speed: float | None = None
+    max_joint_speed: float | None = 12.0
+    pose_scale: float = 0.5  # rad, gentle HOME regularizer during the whole turn
 
     def __post_init__(self):
-        for name in ("max_yaw_rate", "max_joint_speed", "finish_joint_tolerance", "finish_joint_speed"):
+        for name in ("max_yaw_rate", "max_joint_speed", "finish_joint_tolerance", "finish_joint_speed", "pose_scale"):
             value = getattr(self, name)
             if value is None and name in ("max_yaw_rate", "max_joint_speed"):
                 continue
@@ -60,9 +61,13 @@ class Turn360Playback:
 
     def update(self, dt, position, quaternion, linear_velocity, angular_velocity,
                supported, body_contact, joint_velocity=None, joint_error=None, both_feet=False):
-        if not np.isfinite(np.concatenate((position, quaternion, linear_velocity, angular_velocity))).all():
+        state = [position, quaternion, linear_velocity, angular_velocity]
+        state.extend(value for value in (joint_velocity, joint_error) if value is not None)
+        if not np.isfinite(np.concatenate(state)).all():
             return "invalid state"
         goal = self.goal
+        if goal.max_joint_speed is not None and joint_velocity is None:
+            raise ValueError("Turn360 joint-speed budget requires measured servo velocities")
         yaw = yaw_from_quat(quaternion)
         delta = yaw - self.last_yaw
         increment = (delta + math.pi) % (2 * math.pi) - math.pi
@@ -84,6 +89,9 @@ class Turn360Playback:
             (c * offset[0] + s * offset[1]) / goal.success_radius,
             (-s * offset[0] + c * offset[1]) / goal.success_radius,
         ], -2, 2)
+        if (goal.max_joint_speed is not None and joint_velocity is not None
+                and np.max(np.abs(joint_velocity)) > goal.max_joint_speed):
+            return f"failed joint-speed budget ({goal.max_joint_speed:.2f} rad/s)"
         if body_contact:
             return "failed non-foot ground contact"
         if tilt > goal.failure_tilt:
