@@ -7737,6 +7737,8 @@ class Turn360Command(CommandTerm):
         self.tilt = torch.zeros_like(self.angle)
         self.angular_speed = torch.zeros_like(self.angle)
         self.yaw_rate = torch.zeros_like(self.angle)
+        self.pose_error = torch.zeros(self.num_envs, 14, device=self.device)
+        self.joint_velocity = torch.zeros_like(self.pose_error)
         self.failed = torch.zeros_like(self.angle, dtype=torch.bool)
         self.succeeded = torch.zeros_like(self.failed)
         self._pending = torch.ones_like(self.failed)
@@ -7745,7 +7747,8 @@ class Turn360Command(CommandTerm):
         self.metrics = {
             name: torch.zeros_like(self.angle)
             for name in ("turns", "yaw_error_rad", "peak_drift_m", "peak_tilt_rad",
-                         "duration_s", "success", "peak_yaw_rate_rad_s", "peak_joint_speed_rad_s")
+                         "duration_s", "success", "peak_yaw_rate_rad_s", "peak_joint_speed_rad_s",
+                         "finish_joint_error_rad", "finish_joint_speed_rad_s")
         }
 
     @property
@@ -7800,6 +7803,11 @@ class Turn360Command(CommandTerm):
             body_contact = _sensor_any_contact(env, "turn_body_ground")
             if supported is None or body_contact is None:
                 raise RuntimeError("Turn360 requires feet and non-foot ground-contact sensors")
+            feet = env.scene.sensors["feet_ground_contact"].data.found
+            both_feet = (feet.reshape(self.num_envs, 2, -1) > 0).any(-1).all(-1)
+            robot = env.scene["robot"]
+            self.pose_error = _servo_joint_pos(env, robot) - _servo_default_joint_pos(env, robot)
+            self.joint_velocity = _servo_joint_vel(env, robot)
             self.air_time = torch.where(supported, 0.0, self.air_time + active * dt)
             finite = torch.isfinite(torch.cat((q, xy, data.root_link_ang_vel_b,
                                                data.root_link_lin_vel_b), dim=-1)).all(-1)
@@ -7819,6 +7827,9 @@ class Turn360Command(CommandTerm):
                 & (self.tilt < self.cfg.success_tilt) & (self.drift < self.cfg.success_radius)
                 & (self.angular_speed < self.cfg.stop_angular_speed)
                 & (linear_speed < self.cfg.stop_linear_speed)
+                & both_feet
+                & (self.pose_error.abs().amax(-1) < self.cfg.finish_joint_tolerance)
+                & (self.joint_velocity.abs().amax(-1) < self.cfg.finish_joint_speed)
             )
             self.hold = torch.where(stable, self.hold + active * dt, 0.0)
             self.succeeded = stable & (self.hold >= self.cfg.hold_time)
@@ -7828,6 +7839,8 @@ class Turn360Command(CommandTerm):
             self.metrics["peak_tilt_rad"] = torch.maximum(self.metrics["peak_tilt_rad"], self.tilt)
             self.metrics["duration_s"].copy_(self.elapsed)
             self.metrics["success"].copy_(self.succeeded.float())
+            self.metrics["finish_joint_error_rad"].copy_(self.pose_error.abs().amax(-1))
+            self.metrics["finish_joint_speed_rad_s"].copy_(self.joint_velocity.abs().amax(-1))
             joint_speed = _servo_joint_vel(env, env.scene["robot"]).abs().amax(dim=-1)
             for name, speed in (("peak_yaw_rate_rad_s", self.yaw_rate.abs()),
                                 ("peak_joint_speed_rad_s", joint_speed)):
@@ -7880,6 +7893,12 @@ def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
     if component == "braking":
         gate = ((cmd.angle / cmd.cfg.target_angle - 0.75) / 0.25).clamp(0, 1)
         return gate * cmd.angular_speed.square()
+    if component in ("finish_pose", "finish_motion"):
+        # Only tax the return to standing in the final quarter of the turn.
+        gate = ((cmd.angle / cmd.cfg.target_angle - 0.75) / 0.25).clamp(0, 1)
+        error = (cmd.pose_error / cmd.cfg.finish_joint_tolerance if component == "finish_pose"
+                 else cmd.joint_velocity / cmd.cfg.finish_joint_speed)
+        return gate * error.square().mean(-1)
     if component == "effort":
         return env.scene["robot"].data.actuator_force.square().sum(-1)
     if component == "yaw_speed":

@@ -21,6 +21,8 @@ def make_env(n=2):
         root_link_lin_vel_b=torch.zeros(n, 3),
         actuator_force=torch.zeros(n, 14),
         joint_vel=torch.zeros(n, 14),
+        joint_pos=torch.full((n, 14), 0.1),
+        default_joint_pos=torch.full((n, 14), 0.1),
     )
     scene = Scene(robot=SimpleNamespace(data=data, find_joints=lambda _: (list(range(14)), [])))
     scene.sensors = {
@@ -208,6 +210,8 @@ def test_cpu_playback_commands_and_success_match_training():
         reason = playback.update(
             env.step_dt, data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy(),
             data.root_link_lin_vel_b[0].numpy(), data.root_link_ang_vel_b[0].numpy(), True, False,
+            joint_velocity=data.joint_vel[0].numpy(),
+            joint_error=(data.joint_pos - data.default_joint_pos)[0].numpy(), both_feet=True,
         )
         np.testing.assert_allclose(playback.command, cmd.command[0].numpy(), atol=1e-6)
         assert bool(cmd.succeeded[0]) == (reason == "success")
@@ -240,3 +244,62 @@ def test_speed_costs_are_off_by_default_and_charge_only_excess():
 def test_invalid_speed_limits_are_rejected(limit):
     with pytest.raises(ValueError):
         mdp.Turn360CommandCfg(resampling_time_range=(1e9, 1e9), max_yaw_rate=limit)
+
+
+@pytest.mark.parametrize("name", ["finish_joint_tolerance", "finish_joint_speed"])
+@pytest.mark.parametrize("value", [None, 0., -1., math.inf, math.nan])
+def test_invalid_finish_thresholds_are_rejected(name, value):
+    from mjlab_microduck.turn360 import Turn360Goal
+
+    with pytest.raises(ValueError):
+        Turn360Goal(**{name: value})
+
+
+@pytest.mark.parametrize("violation", ["head", "leg", "moving", "one_foot"])
+def test_finish_requires_home_pose_slow_joints_and_both_feet_in_training_and_playback(violation):
+    from mjlab_microduck.turn360 import Turn360Playback
+
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    playback = Turn360Playback(data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy())
+    if violation in ("head", "leg"):
+        data.joint_pos[0, 6 if violation == "head" else 0] += 0.4
+    elif violation == "moving":
+        data.joint_vel[0, 0] = 2.
+    else:
+        env.scene.sensors["feet_ground_contact"].data.found[:, 1] = 0.
+
+    def step(angle):
+        advance(env, cmd, angle)
+        reason = playback.update(
+            env.step_dt, data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy(),
+            data.root_link_lin_vel_b[0].numpy(), data.root_link_ang_vel_b[0].numpy(), True, False,
+            joint_velocity=data.joint_vel[0].numpy(),
+            joint_error=(data.joint_pos - data.default_joint_pos)[0].numpy(),
+            both_feet=bool(env.scene.sensors["feet_ground_contact"].data.found.all()),
+        )
+        assert bool(cmd.succeeded[0]) == (reason == "success")
+        return reason
+
+    for angle in [90, 180, 270, 360] + [360] * 20:
+        assert step(angle) is None
+    data.joint_pos.copy_(data.default_joint_pos)
+    data.joint_vel.zero_()
+    env.scene.sensors["feet_ground_contact"].data.found[:] = 1.
+    for _ in range(15):
+        assert step(360) is None
+    assert step(360) == "success"
+
+
+def test_finish_costs_only_apply_near_end_and_measure_configured_pose():
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    data.joint_pos += cmd.cfg.finish_joint_tolerance
+    data.joint_vel[:] = cmd.cfg.finish_joint_speed
+    for angle in [90, 180, 270]:
+        advance(env, cmd, angle)
+        assert mdp.turn360_reward(env, "finish_pose").item() == 0.
+        assert mdp.turn360_reward(env, "finish_motion").item() == 0.
+    advance(env, cmd, 360)
+    assert mdp.turn360_reward(env, "finish_pose").item() == pytest.approx(1.)
+    assert mdp.turn360_reward(env, "finish_motion").item() == pytest.approx(1.)

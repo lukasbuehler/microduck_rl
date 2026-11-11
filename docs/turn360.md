@@ -62,6 +62,8 @@ reward = 8 * (p_t - p_(t-1)) / (2*pi)
                + 0.05 * braking_gate * angular_speed^2
                + 0.001 * sum(actuator_torque^2))
        + inherited roll/pitch-rate, action-rate and self-collision penalties
+       - dt * finish_gate * (0.5 * mean((joint_error / 0.25)^2)
+                             + 0.1 * mean((joint_velocity / 1.0)^2))
 ```
 
 `braking_gate` rises linearly from 0 at 270° to 1 at 360°. Progress only pays
@@ -82,7 +84,24 @@ Success requires all of the following for 0.3 continuous seconds:
 - Signed rotation within 10° of +360° (not heading modulo 360°).
 - Tilt below 15° and horizontal drift below 6 cm.
 - Angular speed below 0.3 rad/s and linear speed below 0.05 m/s.
-- Foot support and no non-foot ground contact.
+- Both feet supported and no non-foot ground contact.
+- Every servo within 0.25 rad (about 14°) of its configured HOME joint position,
+  including all head/neck and leg joints.
+- Every servo moving below 1.0 rad/s.
+
+The standing-finish experiment adds the last three requirements and the two
+finish costs above. `joint_error` is measured relative to the robot's configured
+`default_joint_pos`, not a sampled reset pose or a recorded walking pose.
+`finish_gate` rises from zero at 270° to one at 360°, like the braking gate.
+This leaves the earlier maneuver free to discover a gait and gives graded
+feedback during settling instead of only a binary success signal. Tolerances
+allow active balance corrections; they are initial experimental choices.
+Joint targets plus two-foot support constrain the stance without prescribing
+exact world-space foot locations. The existing base drift/heading checks remain.
+
+The CPU runner now applies these stricter finish checks to any Turn360 ONNX,
+including old exports; it does not modify their learned actions. Preserve the
+v1 checkpoint and code revision for comparisons with the original criteria.
 
 Failure ends the episode on non-foot ground contact, tilt above 45°, drift
 above 20 cm, invalid state, or over 60 ms airborne after a 250 ms reset grace
@@ -113,8 +132,8 @@ not as established actuator limits. A 3 rad/s yaw bound implies at least about
 
 Each cost is `max(abs(speed)/limit - 1, 0)^2`, weighted -1 per second. The joint
 cost averages over the 14 servo joints, excluding passive joints. Both costs
-are zero below the configured threshold. `None` disables each budget, preserving
-v1's objective. MLflow records thresholds, weights and component costs.
+are zero below the configured threshold. `None` disables the corresponding
+speed cost. MLflow records thresholds, weights and component costs.
 
 For a controlled comparison, enable **one** budget in a fresh run with the same
 seed/environment count/iteration budget first. Keep the original checkpoint.
@@ -123,8 +142,8 @@ output, motor torque or joint velocity is clamped during playback. Existing
 policies must be retrained to learn a new budget; the speed limit is not a
 runtime command input, and changing it does not retime an already trained ONNX.
 
-Speed budgets do not constrain the final joint pose. A neutral-pose objective or
-an acceleration/jerk cost would be separate experiments if flailing persists.
+Speed budgets do not constrain the final joint pose. Keep them disabled for the
+standing-finish experiment to isolate the change in the landing objective.
 
 ## Architecture and reproducibility
 
@@ -196,10 +215,33 @@ completion calculations against the training implementation. It uses simulator
 pose/contact feedback, not a hardware estimator. Entry is restricted to settled,
 upright foot support; this is not yet a learned walking-to-spin transition.
 
-An arbitrary final head/leg configuration is currently allowed: success checks
-base orientation, rotation, drift and speed, not joint pose. The walking policy
-may bring it back toward its usual posture on handoff, but that transition needs
-rollout testing. A neutral finishing-pose reward would be a separate experiment.
+The standing-finish objective must be learned by retraining. A v1 policy may
+still finish in an arbitrary head/leg configuration and fail the new criteria.
+The walking handoff still needs rollout testing with the newly trained policy.
+Entry while walking is deliberately blocked because training starts at rest.
+
+### Standing-finish experiment: next desktop check
+
+First run the required five-iteration CUDA smoke test with the new objective:
+
+```bash
+uv run --extra tracking train-tracked --run-name turn360-standing-smoke \
+  Mjlab-Turn360-Flat-MicroDuck \
+  --env.scene.num-envs 64 --agent.max-iterations 5 --agent.seed 42
+```
+
+After it passes, use a fresh run named `turn360-standing-v2-seed42` with the
+same 1024 environments, seed 42 and 1000 iterations as v1. Do not initialize
+from v1 for this first controlled comparison. Finish error/speed are logged as
+`Metrics/twist/finish_joint_error_rad` and `finish_joint_speed_rad_s`; these
+measure the largest absolute servo error/speed at the episode end, averaged
+across episodes, rather than peaks over the maneuver.
+
+The first v1 combined-runner measurements failed after 0.16 s at 62–73°,
+with peak yaw rates 11.35–12.84 rad/s and joint speeds 11.78–12.28 rad/s.
+These were early posture/contact failures, not successful full turns followed
+by a bad handoff. The runner now distinguishes non-foot contact, tilt and drift
+failures. A finish reward alone is not evidence that this early failure is fixed.
 
 For periodic training videos, append `--video --video-interval 5000
 --video-length 200` to the training command. Video rendering adds overhead;

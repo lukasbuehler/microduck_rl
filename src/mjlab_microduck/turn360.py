@@ -22,15 +22,19 @@ class Turn360Goal:
     stop_linear_speed: float = 0.05
     hold_time: float = 0.3
     max_air_time: float = 0.06
-    # Training-only soft limits. None reproduces the original reward.
+    finish_joint_tolerance: float = 0.25  # rad, every servo relative to HOME
+    finish_joint_speed: float = 1.0  # rad/s, every servo
+    # Training-only soft limits. None disables these speed costs.
     max_yaw_rate: float | None = None
     max_joint_speed: float | None = None
 
     def __post_init__(self):
-        for name in ("max_yaw_rate", "max_joint_speed"):
+        for name in ("max_yaw_rate", "max_joint_speed", "finish_joint_tolerance", "finish_joint_speed"):
             value = getattr(self, name)
-            if value is not None and (not math.isfinite(value) or value <= 0):
-                raise ValueError(f"{name} must be a positive finite value in rad/s, or None")
+            if value is None and name in ("max_yaw_rate", "max_joint_speed"):
+                continue
+            if value is None or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
 
 
 def yaw_from_quat(quaternion):
@@ -55,7 +59,7 @@ class Turn360Playback:
         self.command = np.array([1., 0., 0.], dtype=np.float32)
 
     def update(self, dt, position, quaternion, linear_velocity, angular_velocity,
-               supported, body_contact, joint_velocity=None):
+               supported, body_contact, joint_velocity=None, joint_error=None, both_feet=False):
         if not np.isfinite(np.concatenate((position, quaternion, linear_velocity, angular_velocity))).all():
             return "invalid state"
         goal = self.goal
@@ -80,8 +84,12 @@ class Turn360Playback:
             (c * offset[0] + s * offset[1]) / goal.success_radius,
             (-s * offset[0] + c * offset[1]) / goal.success_radius,
         ], -2, 2)
-        if body_contact or tilt > goal.failure_tilt or drift > goal.failure_radius:
-            return "failed posture/contact"
+        if body_contact:
+            return "failed non-foot ground contact"
+        if tilt > goal.failure_tilt:
+            return f"failed tilt ({math.degrees(tilt):.1f} deg)"
+        if drift > goal.failure_radius:
+            return f"failed drift ({drift:.3f} m)"
         if self.elapsed > 0.25 and self.air_time > goal.max_air_time:
             return "airborne"
         valid = supported and tilt < goal.progress_tilt
@@ -93,6 +101,9 @@ class Turn360Playback:
             and tilt < goal.success_tilt and drift < goal.success_radius
             and np.linalg.norm(angular_velocity) < goal.stop_angular_speed
             and np.linalg.norm(linear_velocity) < goal.stop_linear_speed
+            and both_feet and joint_error is not None and joint_velocity is not None
+            and np.max(np.abs(joint_error)) < goal.finish_joint_tolerance
+            and np.max(np.abs(joint_velocity)) < goal.finish_joint_speed
         )
         # Match training's float32 accumulation at the hold-time boundary.
         self.hold = np.float32(self.hold + np.float32(dt)) if stable else np.float32(0.0)

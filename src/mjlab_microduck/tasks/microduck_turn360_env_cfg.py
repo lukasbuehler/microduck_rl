@@ -107,6 +107,8 @@ def make_microduck_turn360_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "effort": -0.001,
         "yaw_speed": -1.0,
         "joint_speed": -1.0,
+        "finish_pose": -0.5,
+        "finish_motion": -0.1,
     }.items():
         cfg.rewards[f"turn_{name}"] = RewardTermCfg(
             func=mdp.turn360_reward, weight=weight, params={"component": name},

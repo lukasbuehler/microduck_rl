@@ -771,7 +771,7 @@ class PolicyInference:
             adr = self._trunk_qpos_adr
             quaternion = self.data.qpos[adr + 3:adr + 7]
             tilt = math.acos(np.clip(1 - 2 * (quaternion[1]**2 + quaternion[2]**2), -1, 1))
-            supported, body_contact = self._turn360_contacts()
+            supported, body_contact, _ = self._turn360_contacts()
             if tilt > goal.success_tilt or not supported or body_contact:
                 print("Stand upright on the feet before starting Turn360")
                 return
@@ -807,13 +807,15 @@ class PolicyInference:
     def _turn360_contacts(self):
         feet = {mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
                 for name in ("left_foot_collision", "right_foot_collision")}
-        supported = body_contact = False
+        touching_feet = set()
+        body_contact = False
         for contact in self.data.contact:
             for robot_geom, other_geom in ((contact.geom1, contact.geom2), (contact.geom2, contact.geom1)):
                 if self.model.geom_bodyid[other_geom] == 0 and self.model.geom_bodyid[robot_geom] != 0:
-                    supported |= robot_geom in feet
+                    if robot_geom in feet:
+                        touching_feet.add(robot_geom)
                     body_contact |= robot_geom not in feet
-        return supported, body_contact
+        return bool(touching_feet), body_contact, touching_feet == feet
 
     def update_behavior(self, dt: float, simulation_dt=None):
         """Advance the behavior timer; hand back to walking/standing when done."""
@@ -821,12 +823,13 @@ class PolicyInference:
             return
         if self.behavior_mode == "turn360":
             adr, vad = self._trunk_qpos_adr, self._trunk_qvel_adr
-            supported, body_contact = self._turn360_contacts()
+            supported, body_contact, both_feet = self._turn360_contacts()
             reason = self.turn360.update(
                 dt if simulation_dt is None else simulation_dt,
                 self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7],
                 self.data.qvel[vad:vad + 3], self.data.qvel[vad + 3:vad + 6],
                 supported, body_contact, joint_velocity=self.get_joint_vel(),
+                joint_error=self.get_joint_pos_relative(), both_feet=both_feet,
             )
             if reason:
                 print(f"Turn360: {reason}, rotation={math.degrees(self.turn360.angle):.1f}°")
