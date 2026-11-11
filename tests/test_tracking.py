@@ -78,6 +78,9 @@ def test_live_bridge_logs_new_events_once_and_resolved_params(tmp_path):
     assert params["env.rewards.turn_progress.weight"] == str(env_cfg.rewards["turn_progress"].weight)
     assert params["env.commands.twist.max_joint_speed"] == "12.0"
     assert params["env.rewards.turn_success.weight"] == "20.0"
+    assert params["env.commands.twist.finish.discount"] == "0.99"
+    assert params["env.rewards.turn_finish_potential.weight"] == "10.0"
+    assert params["env.rewards.turn_finish_credit.weight"] == "6.0"
     joint_key = "env.scene.terrain.init_state.joint_pos"
     assert ".*" in client.get_run(run_id).data.params[joint_key]
     assert client.list_artifacts(run_id, "params")[0].path == "params/agent.yaml"

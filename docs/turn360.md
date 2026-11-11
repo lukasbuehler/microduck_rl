@@ -47,12 +47,14 @@ uv run --extra tracking train-tracked --run-name turn360-v1-seed42 \
 Changing environment count also changes PPO batch size. Keep it fixed when
 comparing reward versions. Repeat promising comparisons across several seeds.
 
-## Reward: v4, allow hops within the servo-speed budget
+## Reward: v5, graded feedback for the standing finish
 
 The v4 change removes contact-based interruption and progress gating in both
 training and CPU playback. Airborne rotation and non-foot ground contact no
 longer fail an attempt. The final standing hold still requires both feet down.
-All reward weights and the 12 rad/s budget are unchanged from v3.
+The v5 change adds finish-potential shaping and bounded terminal finish credit. Other reward
+weights, hopping permissions, success thresholds and the 12 rad/s budget stay
+unchanged, isolating the new finish feedback.
 
 There is no target yaw rate or prescribed duration. The eight-second deadline
 bounds an attempt; the servo-speed budget limits allowed motion. PPO's discount
@@ -67,6 +69,8 @@ reward = 4 * delta_progress / (2*pi)
        + 4 * first_reach_350_degrees
        + 1 * stable_one_foot_delta_progress / (2*pi)
        + 20 * success - 8 * (failure OR incomplete_deadline)
+       + 10 * (0.99 * next_finish_potential - previous_finish_potential)
+       + 6 * terminal_finish_quality_if_success_or_deadline
        - dt * (0.5 * sin(tilt)^2
                + 0.2 * (distance_from_start / 0.06)^2
                + 0.1 * mean((joint_error / 0.5)^2)
@@ -100,6 +104,64 @@ mjlab multiplies rewards by dt. Progress and impulse functions divide by dt;
 the listed payouts are episode totals and the costs are per-second rates.
 The frontier is bounded shaping, not policy-invariant potential shaping.
 These weights are experimental hypotheses, not guarantees of convergence.
+
+### Dense finish feedback
+
+The old objective paid for rotation progress even when the policy never found
+the strict standing finish. Its gentle HOME cost did not explicitly explain
+how to brake after rotating. The user observed a jerky maneuver ending in
+folded poses, with no successes. Sampled frames from the supplied recording
+also show head-down/folded end states. They do not establish a collision or
+interpenetration exploit; that would require contact/state telemetry.
+
+The new score Phi describes the current finish, not the furthest angle reached:
+
+```text
+angle_cost   = ((theta - 2*pi) / (pi/2))^2
+pose_cost    = (max_abs_joint_error / 0.75)^2
+motion_cost  = (max_abs_joint_speed / 4)^2
+             + (base_angular_speed / 3)^2 + (base_linear_speed / 0.2)^2
+balance_cost = (tilt / radians(30))^2 + (drift / 0.12)^2
+Phi = exp(-angle_cost - (pose_cost + motion_cost + balance_cost)/3)
+      * (0.5 + 0.25 * number_of_grounded_feet)
+```
+
+Phi ranges from zero to one. The broad scales provide a gradient before the
+much stricter success thresholds are reached. Worst-joint errors keep one bad
+head or leg joint from disappearing into an average. Both undershoot and
+overshoot reduce the score, as do moving limbs or base, poor posture, tilt and
+drift. Foot support improves the finish score without forbidding hops. Reset
+potential is defined as zero.
+
+The shaping term uses `gamma * Phi(next) - Phi(previous)`, with gamma matching
+PPO (0.99). Each absorbing terminal state has zero potential, including
+success, failure, deadline and external terminations. The actual state score
+is still logged at termination. A terminal shaping contribution can therefore
+be negative even on success, alongside the unchanged +20 success bonus.
+
+With matching discounts, these signed changes telescope over a discounted
+episode. Repeated jitter, moving away and returning, crashing, or timing out
+cannot retain an extra shaping return. This potential term improves local
+reward/credit feedback without changing the underlying discounted objective.
+
+Separately, success or an unfinished deadline pays `6 * Phi(actual end state)`
+once. Physical failures receive no such credit. This is a deliberate change
+to the task objective: a near-complete, quiet HOME stance is worth more than
+a folded or moving partial turn even when neither meets strict success.
+The maximum credit is below the unchanged -8 failure/deadline penalty, so the
+terminal subtotal on a timeout stays negative. The +20 held-success bonus remains
+the main finish payoff. This credit grades only the final state, so it cannot
+be collected repeatedly by jittering during an attempt. Neither term guarantees
+exploration will discover success; per-step standing payouts are avoided.
+
+Scales and discount are recorded under `env.commands.twist.finish.*`; the
+weights are `env.rewards.turn_finish_potential.weight` and
+`env.rewards.turn_finish_credit.weight`. If overriding PPO gamma,
+also set `--env.commands.twist.finish.discount` to the same value. MLflow logs
+the signed `Episode_Reward/turn_finish_potential`, terminal
+`Episode_Reward/turn_finish_credit`, and state diagnostics
+`Metrics/twist/finish_quality` and `finish_hold_s`. The score is a diagnostic,
+not a replacement for success. Evaluate actual video and the strict finish.
 
 Success requires all of the following for 0.3 continuous seconds:
 
@@ -239,17 +301,16 @@ still finish in an arbitrary head/leg configuration and fail the new criteria.
 The walking handoff still needs rollout testing with the newly trained policy.
 Entry while walking is deliberately blocked because training starts at rest.
 
-### v4 hopping experiment
+### v5 finish-shaping experiment
 
-After pulling, the existing v3 ONNX can be replayed immediately with the relaxed
-contact checks. Its learned actions are unchanged. Retraining is required to
-learn airborne progress under the new objective.
+Retraining is required to learn from the new finish feedback. Existing ONNX
+actions and playback stopping rules are unchanged by the shaping term.
 
 Pull branch `lukas`, then run the required five-iteration CUDA smoke test:
 
 ```bash
 git pull --ff-only origin lukas
-uv run --extra tracking train-tracked --run-name turn360-hops-v4-smoke \
+uv run --extra tracking train-tracked --run-name turn360-finish-v5-smoke \
   Mjlab-Turn360-Flat-MicroDuck \
   --env.scene.num-envs 64 --agent.max-iterations 5 --agent.seed 42
 ```
@@ -258,7 +319,7 @@ After it passes, a fresh comparison run uses 2048 environments (matching the
 actual v2/v3 runs), seed 42 and 1000 iterations:
 
 ```bash
-uv run --extra tracking train-tracked --run-name turn360-hops-v4-seed42 \
+uv run --extra tracking train-tracked --run-name turn360-finish-v5-seed42 \
   Mjlab-Turn360-Flat-MicroDuck \
   --env.scene.num-envs 2048 --agent.max-iterations 1000 --agent.seed 42
 ```

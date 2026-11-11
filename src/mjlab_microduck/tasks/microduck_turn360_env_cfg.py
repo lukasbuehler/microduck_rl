@@ -80,6 +80,7 @@ def make_microduck_turn360_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.events["reset_base"].params["velocity_range"] = {}
     cfg.commands["twist"] = mdp.Turn360CommandCfg(
         resampling_time_range=(1e9, 1e9),
+        finish=mdp.Turn360FinishCfg(discount=MicroduckRlCfg.algorithm.gamma),
     )
     for name, dim in (("head_pose", 4), ("body_pose", 6)):
         cfg.commands[name] = mdp.UniformPoseCommandCfg(
@@ -94,7 +95,7 @@ def make_microduck_turn360_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     }
     cfg.rewards["body_ang_vel"].weight = -0.05  # roll/pitch rates only
     cfg.rewards["action_rate_l2"].weight = -0.002
-    # Functions return nonnegative costs or reward rates; signs live here.
+    # Costs are nonnegative; the signed finish potential has a positive weight.
     for name, weight in {
         "progress": 4.0,
         "completion": 4.0,
@@ -107,6 +108,8 @@ def make_microduck_turn360_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "yaw_speed": -1.0,
         "joint_speed": -1.0,
         "finish_pose": -0.1,
+        "finish_potential": 10.0,
+        "finish_credit": 6.0,
     }.items():
         cfg.rewards[f"turn_{name}"] = RewardTermCfg(
             func=mdp.turn360_reward, weight=weight, params={"component": name},

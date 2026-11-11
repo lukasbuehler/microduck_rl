@@ -193,6 +193,9 @@ def test_cfg_preserves_layout_and_has_real_body_contacts():
         assert cfg.commands["twist"].target_angle == 2 * math.pi
         assert cfg.commands["twist"].max_joint_speed == 12.
         assert cfg.commands["twist"].max_yaw_rate is None
+        assert cfg.commands["twist"].finish.discount == MicroduckTurn360RlCfg.algorithm.gamma
+        assert cfg.rewards["turn_finish_potential"].weight > 0
+        assert 0 < cfg.rewards["turn_finish_credit"].weight < -cfg.rewards["turn_failure"].weight
         assert cfg.rewards["turn_success"].weight > cfg.rewards["turn_progress"].weight
         assert "turn_braking" not in cfg.rewards
         assert "turn_finish_motion" not in cfg.rewards
@@ -419,3 +422,118 @@ def test_passive_joint_speed_does_not_affect_budget_or_pose_cost():
     assert not cmd.failed.any()
     assert mdp.turn360_reward(env, "joint_speed").item() == 0.
     assert mdp.turn360_reward(env, "finish_pose").item() == 0.
+
+
+def test_finish_quality_guides_angle_pose_and_braking_before_binary_success():
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    qualities = []
+    for angle in (90, 180, 270, 330, 360):
+        advance(env, cmd, angle)
+        qualities.append(cmd.finish_quality.item())
+    assert qualities == sorted(qualities)
+    assert qualities[-1] == pytest.approx(1.)
+    assert not cmd.succeeded.any()  # dense feedback is available before a held finish
+    for joint in (0, 6):  # one bad leg OR head joint must lower the score
+        data.joint_pos[0, joint] += 1.
+        advance(env, cmd, 360)
+        assert cmd.finish_quality.item() < qualities[-1]
+        data.joint_pos.copy_(data.default_joint_pos)
+    for speed in (8., 4., 0.):
+        data.joint_vel[0, 6] = speed
+        advance(env, cmd, 360)
+        qualities.append(cmd.finish_quality.item())
+    assert qualities[-3] < qualities[-2] < qualities[-1]
+    assert cmd.finish_quality.item() == pytest.approx(1.)
+
+
+def test_finish_quality_uses_current_angle_and_never_pays_for_just_holding():
+    env, cmd = make_env(n=1)
+    for angle in (90, 180, 270, 360):
+        advance(env, cmd, angle)
+    advance(env, cmd, 360)
+    holding = mdp.turn360_reward(env, "finish_potential").item() * env.step_dt
+    assert holding == pytest.approx(cmd.cfg.finish.discount - 1.)
+    advance(env, cmd, 450)
+    assert cmd.frontier.item() == pytest.approx(2 * math.pi)
+    assert cmd.finish_quality.item() < 1.
+    assert mdp.turn360_reward(env, "finish_potential").item() < 0.
+
+
+def test_discounted_finish_shaping_cannot_profit_from_jitter_or_external_termination():
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    total = 0.
+    for index, angle in enumerate([90, 180, 270, 360] + [360] * 10):
+        data.joint_vel[0, 0] = 8. if index % 2 else 0.
+        if index == 13:
+            env.reset_buf = torch.ones(1, dtype=torch.bool)
+        advance(env, cmd, angle)
+        term = mdp.turn360_reward(env, "finish_potential").item() * env.step_dt
+        total += cmd.cfg.finish.discount ** index * term
+    # The signed, discounted changes telescope to zero from the reset potential.
+    # An external terminal must cancel remaining potential, not pay it out.
+    assert total == pytest.approx(0., abs=2e-7)
+
+
+@pytest.mark.parametrize("ending", ["success", "timeout", "failure"])
+def test_finish_potential_is_zero_at_every_task_terminal(ending):
+    env, cmd = make_env(n=1)
+    for angle in (90, 180, 270, 360):
+        advance(env, cmd, angle)
+    previous = cmd.finish_quality.item()
+    if ending == "success":
+        cmd.hold[:] = 0.29
+    elif ending == "timeout":
+        cmd.elapsed[:] = 7.99
+    else:
+        env.scene["robot"].data.root_link_pos_w[:, 0] = 0.3
+    advance(env, cmd, 360)
+    assert (cmd.succeeded | cmd.timed_out | cmd.failed).all()
+    assert mdp.turn360_reward(env, "finish_potential").item() * env.step_dt == pytest.approx(-previous)
+
+
+def test_partial_reset_clears_finish_history_only_for_reset_robot():
+    env, cmd = make_env(n=2)
+    for angle in (90, 180, 270, 360):
+        advance(env, cmd, angle)
+    score = cmd.finish_quality[1].clone()
+    cmd.reset(torch.tensor([0]))
+    cmd.compute(env.step_dt)
+    assert cmd.finish_quality[0] == 0.
+    assert cmd.previous_finish_quality[0] == 0.
+    assert cmd.finish_quality[1] == score
+
+
+@pytest.mark.parametrize("name,value", [("discount", 1.1), ("discount", math.nan),
+                                        ("pose_scale", 0.), ("joint_speed_scale", -1.)])
+def test_invalid_finish_shaping_configuration_is_rejected(name, value):
+    with pytest.raises(ValueError):
+        mdp.Turn360FinishCfg(**{name: value})
+
+
+def test_deadline_finish_credit_grades_near_misses_without_requiring_success():
+    env, cmd = make_env(n=2)
+    for angle in (90, 180, 270, 355):
+        advance(env, cmd, angle)
+    assert mdp.turn360_reward(env, "finish_credit").eq(0).all()  # no standing payouts
+    # Both have completed the turn, but only one is close to HOME and quiet.
+    data = env.scene["robot"].data
+    data.joint_pos[0, 6] += 1.
+    data.joint_vel[0, 0] = 8.
+    cmd.elapsed[:] = 7.99
+    advance(env, cmd, 355)
+    assert cmd.timed_out.all()
+    assert not cmd.succeeded.any()
+    credit = mdp.turn360_reward(env, "finish_credit") * env.step_dt
+    assert 0 < credit[0] < credit[1] <= 1.
+
+
+def test_physical_failure_cannot_cash_out_finish_credit():
+    env, cmd = make_env(n=1)
+    for angle in (90, 180, 270, 355):
+        advance(env, cmd, angle)
+    env.scene["robot"].data.joint_vel[0, 0] = 13.
+    advance(env, cmd, 355)
+    assert cmd.failed.all()
+    assert mdp.turn360_reward(env, "finish_credit").item() == 0.

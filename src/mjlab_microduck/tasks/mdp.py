@@ -2,7 +2,7 @@
 
 import math
 import os
-from dataclasses import dataclass as _dataclass
+from dataclasses import dataclass as _dataclass, field as _field
 
 import numpy as np
 import torch
@@ -7709,8 +7709,47 @@ def roulade_lateral_velocity_penalty(
 
 
 # --------------------------------------------------------------------------- #
-# Turn360: one grounded, counterclockwise revolution and a stable stop.         #
+# Turn360: one counterclockwise revolution and a stable standing finish.       #
 # --------------------------------------------------------------------------- #
+
+@_dataclass(kw_only=True)
+class Turn360FinishCfg:
+    """Broad shaping scales, separate from the strict success tolerances."""
+
+    discount: float = 0.99  # must match PPO gamma
+    angle_scale: float = math.pi / 2
+    pose_scale: float = 0.75
+    joint_speed_scale: float = 4.0
+    angular_speed_scale: float = 3.0
+    linear_speed_scale: float = 0.2
+    tilt_scale: float = math.radians(30)
+    drift_scale: float = 0.12
+
+    def __post_init__(self):
+        for name, value in vars(self).items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"finish.{name} must be positive and finite")
+        if self.discount > 1:
+            raise ValueError("finish.discount must be at most one")
+
+
+def turn360_finish_quality(cmd, linear_speed, foot_count):
+    """Bounded score for the CURRENT full-turn, HOME, quiet standing state.
+
+    Worst-joint errors keep a single misplaced or jittering servo visible.
+    Broad scales provide feedback before strict success is achievable.
+    """
+    cfg = cmd.cfg.finish
+    angle_cost = ((cmd.angle - cmd.cfg.target_angle) / cfg.angle_scale).square()
+    pose_cost = (cmd.pose_error.abs().amax(-1) / cfg.pose_scale).square()
+    motion_cost = ((cmd.joint_velocity.abs().amax(-1) / cfg.joint_speed_scale).square()
+                   + (cmd.angular_speed / cfg.angular_speed_scale).square()
+                   + (linear_speed / cfg.linear_speed_scale).square())
+    balance_cost = ((cmd.tilt / cfg.tilt_scale).square()
+                    + (cmd.drift / cfg.drift_scale).square())
+    quality = torch.exp(-angle_cost - (pose_cost + motion_cost + balance_cost) / 3)
+    return torch.nan_to_num(quality * (0.5 + 0.25 * foot_count), nan=0.0)
+
 
 class Turn360Command(CommandTerm):
     """Own episode state once, shared by commands, rewards and terminations.
@@ -7744,6 +7783,8 @@ class Turn360Command(CommandTerm):
         self.rotation_completed = torch.zeros_like(self.failed)
         self.completion = torch.zeros_like(self.failed)
         self.pirouette_progress = torch.zeros_like(self.angle)
+        self.finish_quality = torch.zeros_like(self.angle)
+        self.previous_finish_quality = torch.zeros_like(self.angle)
         self._pending = torch.ones_like(self.failed)
         self._needs_reset_capture = True
         self._last_step = -1
@@ -7753,7 +7794,8 @@ class Turn360Command(CommandTerm):
                          "duration_s", "success", "peak_yaw_rate_rad_s", "peak_joint_speed_rad_s",
                          "finish_joint_error_rad", "finish_joint_speed_rad_s",
                          "rotation_completed", "joint_speed_violation", "timeout",
-                         "finish_angle_ok", "finish_pose_ok", "finish_motion_ok", "finish_support_ok")
+                         "finish_angle_ok", "finish_pose_ok", "finish_motion_ok", "finish_support_ok",
+                         "finish_quality", "finish_hold_s")
         }
 
     @property
@@ -7762,7 +7804,8 @@ class Turn360Command(CommandTerm):
 
     def _resample_command(self, env_ids):
         for value in (self.angle, self.frontier, self.progress, self.elapsed,
-                      self.hold, self.drift, self.tilt, self.yaw_rate):
+                      self.hold, self.drift, self.tilt, self.yaw_rate,
+                      self.finish_quality, self.previous_finish_quality):
             value[env_ids] = 0.0
         self.failed[env_ids] = False
         self.succeeded[env_ids] = False
@@ -7853,6 +7896,10 @@ class Turn360Command(CommandTerm):
                         if hasattr(env, "episode_length_buf")
                         else self.elapsed >= TURN360_EPISODE_LENGTH_S)
             self.timed_out = active & deadline & ~self.succeeded & ~self.failed
+            self.previous_finish_quality.copy_(self.finish_quality)
+            self.finish_quality = torch.where(
+                active, turn360_finish_quality(self, linear_speed, foot_count), 0.0,
+            )
             self.metrics["turns"].copy_(self.angle / (2 * math.pi))
             self.metrics["yaw_error_rad"].copy_((self.cfg.target_angle - self.angle).abs())
             self.metrics["peak_drift_m"] = torch.maximum(self.metrics["peak_drift_m"], self.drift)
@@ -7861,6 +7908,8 @@ class Turn360Command(CommandTerm):
             self.metrics["success"].copy_(self.succeeded.float())
             self.metrics["finish_joint_error_rad"].copy_(self.pose_error.abs().amax(-1))
             self.metrics["finish_joint_speed_rad_s"].copy_(self.joint_velocity.abs().amax(-1))
+            self.metrics["finish_quality"].copy_(self.finish_quality)
+            self.metrics["finish_hold_s"].copy_(self.hold)
             for name, value in (("rotation_completed", self.rotation_completed),
                                 ("joint_speed_violation", speed_violation), ("timeout", self.timed_out),
                                 ("finish_angle_ok", near_goal), ("finish_pose_ok", pose_ok),
@@ -7882,6 +7931,8 @@ class Turn360Command(CommandTerm):
 
 @_dataclass(kw_only=True)
 class Turn360CommandCfg(Turn360Goal, CommandTermCfg):
+    finish: Turn360FinishCfg = _field(default_factory=Turn360FinishCfg)
+
     def build(self, env):
         return Turn360Command(self, env)
 
@@ -7923,6 +7974,20 @@ def turn360_reward(env: ManagerBasedRlEnv, component: str) -> torch.Tensor:
     if component == "finish_pose":
         # Gentle, fixed target throughout: no angle-dependent cost barrier.
         return (cmd.pose_error / cmd.cfg.pose_scale).square().mean(-1)
+    if component == "finish_potential":
+        # Discount-corrected potential shaping. Absorbing terminal potential is
+        # zero, including external terminations (e.g. nan_state), so partial
+        # finishes cannot retain a shaping payout by timing out or crashing.
+        terminal = cmd.failed | cmd.succeeded | cmd.timed_out
+        if hasattr(env, "reset_buf"):
+            terminal = terminal | env.reset_buf
+        next_quality = torch.where(terminal, 0.0, cmd.finish_quality)
+        return (cmd.cfg.finish.discount * next_quality - cmd.previous_finish_quality) / env.step_dt
+    if component == "finish_credit":
+        # Grade near-misses at the deadline, not only perfect binary success.
+        # Crashing/speed violations cannot cash out this partial credit.
+        eligible = cmd.succeeded | cmd.timed_out
+        return torch.where(eligible, cmd.finish_quality, 0.0) / env.step_dt
     if component == "effort":
         return env.scene["robot"].data.actuator_force.square().sum(-1)
     if component == "yaw_speed":
