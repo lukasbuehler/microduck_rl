@@ -7774,6 +7774,7 @@ class Turn360Command(CommandTerm):
         self.drift = torch.zeros_like(self.angle)
         self.tilt = torch.zeros_like(self.angle)
         self.angular_speed = torch.zeros_like(self.angle)
+        self.linear_speed = torch.zeros_like(self.angle)
         self.yaw_rate = torch.zeros_like(self.angle)
         self.pose_error = torch.zeros(self.num_envs, 14, device=self.device)
         self.joint_velocity = torch.zeros_like(self.pose_error)
@@ -7850,7 +7851,8 @@ class Turn360Command(CommandTerm):
             self.drift = torch.linalg.vector_norm(xy - self.origin, dim=-1)
             self.tilt = torch.acos((1 - 2 * (x * x + y * y)).clamp(-1, 1))
             self.angular_speed = torch.linalg.vector_norm(data.root_link_ang_vel_b, dim=-1)
-            linear_speed = torch.linalg.vector_norm(data.root_link_lin_vel_b, dim=-1)
+            self.linear_speed = torch.linalg.vector_norm(data.root_link_lin_vel_b, dim=-1)
+            linear_speed = self.linear_speed
             feet = env.scene.sensors["feet_ground_contact"].data.found
             foot_count = (feet.reshape(self.num_envs, 2, -1) > 0).any(-1).sum(-1)
             both_feet = foot_count == 2

@@ -343,6 +343,41 @@ leave it off for throughput comparisons. Videos are archived to MLflow at exit.
 
 ## CPU checks
 
+### Diagnose a checkpoint's finish before changing rewards
+
+This headless evaluator uses CPU by default, the same checkpoint actor and
+normalizer loading as `play`, no sampled policy actions, and no actor observation
+noise. Task domain randomization remains enabled. Each invocation restarts the
+same seeded reset sequence with one environment, so compare checkpoints using
+the same seed and episode count. CPU and GPU physics are separate evidence.
+
+```bash
+uv run scripts/evaluate_turn360.py \
+  --checkpoint-file logs/rsl_rl/microduck_turn360/YOUR_RUN/model_100.pt \
+  --episodes 3 --seed 42 --device cpu
+```
+
+It reports the closest simultaneous set of finish checks, the worst pose joint,
+fastest joint, longest continuous hold, and which conditions pass while near the
+target angle. The closest sample maximizes the number of simultaneously passed
+checks, breaking ties by the largest normalized numeric error. It is not a
+synthetic combination of the best measurements from different frames.
+
+Detailed final/closest values and thresholds are saved to
+`YOUR_RUN/evaluation/model_100_seed42.json`, alongside checkpoint SHA256,
+evaluation revision/dirty flag and resolved goal configuration. Terminal states
+are inspected before reset. Attach that JSON or paste the episode summaries.
+Repeat with `model_200.pt` only after inspecting checkpoint 100's report.
+
+Training reward-component averages use sampled actions and are not a matched
+deterministic checkpoint evaluation. The signed finish-potential component is
+not itself a success score. Foot sliding is permitted by the current objective;
+it is not sufficient evidence of a simulator exploit. Preserve an earlier
+checkpoint if its actual motion is preferable, rather than assuming the last
+training checkpoint is best.
+
+### Regression suite
+
 ```bash
 uv run --extra tracking --with pytest pytest tests/test_turn360.py tests/test_tracking.py -q
 ```
