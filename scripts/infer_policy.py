@@ -773,8 +773,8 @@ class PolicyInference:
             adr = self._trunk_qpos_adr
             quaternion = self.data.qpos[adr + 3:adr + 7]
             tilt = math.acos(np.clip(1 - 2 * (quaternion[1]**2 + quaternion[2]**2), -1, 1))
-            supported, body_contact, _ = self._turn360_contacts()
-            if tilt > goal.success_tilt or not supported or body_contact:
+            supported, _, _ = self._turn360_contacts()
+            if tilt > goal.success_tilt or not supported:
                 print("Stand upright on the feet before starting Turn360")
                 return
             self.turn360 = Turn360Playback(self.data.qpos[adr:adr + 3], self.data.qpos[adr + 3:adr + 7], goal=goal)
@@ -806,29 +806,17 @@ class PolicyInference:
         foot = behavior.split("_")[1]
         print(f"Ball placed at ({bx:.3f}, {by:.3f}) in front of the {foot} foot")
 
-    def _turn360_contacts(self, report=False):
+    def _turn360_contacts(self):
         feet = {mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
                 for name in ("left_foot_collision", "right_foot_collision")}
         touching_feet = set()
         body_contact = False
-        for index, contact in enumerate(self.data.contact):
+        for contact in self.data.contact:
             for robot_geom, other_geom in ((contact.geom1, contact.geom2), (contact.geom2, contact.geom1)):
                 if self.model.geom_bodyid[other_geom] == 0 and self.model.geom_bodyid[robot_geom] != 0:
                     if robot_geom in feet:
                         touching_feet.add(robot_geom)
                     body_contact |= robot_geom not in feet
-                    if report and robot_geom not in feet:
-                        body_id = self.model.geom_bodyid[robot_geom]
-                        body = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-                        geom = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, robot_geom)
-                        mesh_id = self.model.geom_dataid[robot_geom]
-                        mesh = (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_MESH, mesh_id)
-                                if self.model.geom_type[robot_geom] == mujoco.mjtGeom.mjGEOM_MESH else None)
-                        force = np.zeros(6)
-                        mujoco.mj_contactForce(self.model, self.data, index, force)
-                        print(f"Turn360 contact: body={body}, geom={geom or f'#{robot_geom}'}, "
-                              f"mesh={mesh}, distance={contact.dist * 1000:.2f} mm, "
-                              f"normal_force={force[0]:.3f} N, active={contact.efc_address >= 0}")
         return bool(touching_feet), body_contact, touching_feet == feet
 
     def update_behavior(self, dt: float, simulation_dt=None):
@@ -846,8 +834,6 @@ class PolicyInference:
                 joint_error=self.get_joint_pos_relative(), both_feet=both_feet,
             )
             if reason:
-                if reason == "failed non-foot ground contact":
-                    self._turn360_contacts(report=True)
                 print(f"Turn360: {reason}, rotation={math.degrees(self.turn360.angle):.1f}°")
                 self._end_behavior()
             else:

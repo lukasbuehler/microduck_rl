@@ -21,7 +21,6 @@ class Turn360Goal:
     stop_angular_speed: float = 0.3
     stop_linear_speed: float = 0.05
     hold_time: float = 0.3
-    max_air_time: float = 0.06
     finish_joint_tolerance: float = 0.25  # rad, every servo relative to HOME
     finish_joint_speed: float = 1.0  # rad/s, every servo
     # No yaw pace target. The servo budget is checked at control steps.
@@ -54,7 +53,7 @@ class Turn360Playback:
         self.goal = goal or Turn360Goal()
         self.origin = np.array(position[:2], dtype=float)
         self.last_yaw = yaw_from_quat(quaternion)
-        self.angle = self.frontier = self.elapsed = self.hold = self.air_time = 0.0
+        self.angle = self.frontier = self.elapsed = self.hold = 0.0
         self.hold = np.float32(0.0)
         self.peak_yaw_rate = self.peak_joint_speed = 0.0
         self.command = np.array([1., 0., 0.], dtype=np.float32)
@@ -78,7 +77,6 @@ class Turn360Playback:
             self.peak_joint_speed = max(self.peak_joint_speed, float(np.max(np.abs(joint_velocity))))
         self.last_yaw = yaw
         self.elapsed += dt
-        self.air_time = 0.0 if supported else self.air_time + dt
         _, x, y, _ = quaternion
         tilt = math.acos(np.clip(1 - 2 * (x * x + y * y), -1, 1))
         offset = self.origin - np.asarray(position[:2])
@@ -92,15 +90,11 @@ class Turn360Playback:
         if (goal.max_joint_speed is not None and joint_velocity is not None
                 and np.max(np.abs(joint_velocity)) > goal.max_joint_speed):
             return f"failed joint-speed budget ({goal.max_joint_speed:.2f} rad/s)"
-        if body_contact:
-            return "failed non-foot ground contact"
         if tilt > goal.failure_tilt:
             return f"failed tilt ({math.degrees(tilt):.1f} deg)"
         if drift > goal.failure_radius:
             return f"failed drift ({drift:.3f} m)"
-        if self.elapsed > 0.25 and self.air_time > goal.max_air_time:
-            return "airborne"
-        valid = supported and tilt < goal.progress_tilt
+        valid = tilt < goal.progress_tilt
         if valid:
             self.frontier = max(self.frontier, np.clip(self.angle, 0, goal.target_angle))
         stable = (

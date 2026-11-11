@@ -88,7 +88,16 @@ def test_requires_standing_entry_and_falls_hand_back_to_recovery(playback):
     assert policy.behavior_mode is None
     policy.set_vel_cmd(0, 0, 0)
     policy.trigger_behavior("turn360")
+    data.qpos[2] += .1
+    mujoco.mj_forward(model, data)
+    for _ in range(20):
+        policy.update_behavior(.02, simulation_dt=.02)
+    assert policy.behavior_mode == "turn360"  # a hop does not force handoff
     data.qpos[2] = .02
+    mujoco.mj_forward(model, data)
+    policy.update_behavior(.02, simulation_dt=.02)
+    assert policy.behavior_mode == "turn360"  # contact alone is not a fall
+    data.qpos[3:7] = [math.sqrt(.5), math.sqrt(.5), 0, 0]
     mujoco.mj_forward(model, data)
     policy.update_behavior(.02, simulation_dt=.02)
     assert policy.behavior_mode is None

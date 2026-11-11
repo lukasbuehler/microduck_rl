@@ -116,22 +116,52 @@ def test_partial_reset_captures_new_origin_without_cross_episode_rotation():
     assert torch.allclose(cmd.angle, torch.deg2rad(torch.tensor([10., 70.])), atol=1e-6)
 
 
-@pytest.mark.parametrize("violation", ["tilt", "body", "drift", "flight"])
+@pytest.mark.parametrize("violation", ["tilt", "drift"])
 def test_failure_blocks_success_and_progress(violation):
     env, cmd = make_env()
-    if violation == "body":
-        env.scene.sensors["turn_body_ground"].data.found[:] = 1
-    elif violation == "drift":
+    if violation == "drift":
         env.scene["robot"].data.root_link_pos_w[:, 0] = 0.3
-    elif violation == "flight":
-        env.scene.sensors["feet_ground_contact"].data.found[:] = 0
-        cmd.elapsed[:] = 1.
-        cmd.air_time[:] = 0.1
     advance(env, cmd, 90, tilt=60 if violation == "tilt" else 0)
     assert cmd.failed.all()
     assert not cmd.succeeded.any()
     assert not cmd.progress.any()
     assert (mdp.turn360_reward(env, "failure") > 0).all()  # negative weight in cfg
+
+
+@pytest.mark.parametrize("airborne,body_contact", [(True, False), (False, True), (True, True)])
+def test_hops_and_nonfoot_contacts_do_not_interrupt_turn_but_finish_requires_landing(airborne, body_contact):
+    from mjlab_microduck.turn360 import Turn360Playback
+
+    env, cmd = make_env(n=1)
+    data = env.scene["robot"].data
+    playback = Turn360Playback(data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy())
+    env.scene.sensors["feet_ground_contact"].data.found[:] = float(not airborne)
+    env.scene.sensors["turn_body_ground"].data.found[:] = float(body_contact)
+
+    def step(angle, landed=False):
+        advance(env, cmd, angle)
+        return playback.update(
+            env.step_dt, data.root_link_pos_w[0].numpy(), data.root_link_quat_w[0].numpy(),
+            data.root_link_lin_vel_b[0].numpy(), data.root_link_ang_vel_b[0].numpy(),
+            not airborne or landed, body_contact, joint_velocity=data.joint_vel[0].numpy(),
+            joint_error=(data.joint_pos - data.default_joint_pos)[0].numpy(),
+            both_feet=not airborne or landed,
+        )
+
+    for angle in (90, 180, 270, 360):
+        assert step(angle) is None
+        assert cmd.progress.item() > 0.
+        assert not cmd.failed.any()
+    if airborne:
+        for _ in range(40):  # exceed the old airborne grace and time limit
+            assert step(360) is None
+            assert not cmd.failed.any()
+            assert not cmd.succeeded.any()
+    env.scene.sensors["feet_ground_contact"].data.found[:] = 1.
+    for _ in range(16):
+        reason = step(360, landed=True)
+    assert reason == "success"
+    assert cmd.succeeded.all()
 
 
 def test_command_origin_error_is_body_relative():

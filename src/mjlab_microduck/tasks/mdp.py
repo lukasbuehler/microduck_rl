@@ -7732,7 +7732,6 @@ class Turn360Command(CommandTerm):
         self.last_yaw = torch.zeros_like(self.angle)
         self.elapsed = torch.zeros_like(self.angle)
         self.hold = torch.zeros_like(self.angle)
-        self.air_time = torch.zeros_like(self.angle)
         self.drift = torch.zeros_like(self.angle)
         self.tilt = torch.zeros_like(self.angle)
         self.angular_speed = torch.zeros_like(self.angle)
@@ -7763,7 +7762,7 @@ class Turn360Command(CommandTerm):
 
     def _resample_command(self, env_ids):
         for value in (self.angle, self.frontier, self.progress, self.elapsed,
-                      self.hold, self.air_time, self.drift, self.tilt, self.yaw_rate):
+                      self.hold, self.drift, self.tilt, self.yaw_rate):
             value[env_ids] = 0.0
         self.failed[env_ids] = False
         self.succeeded[env_ids] = False
@@ -7809,17 +7808,12 @@ class Turn360Command(CommandTerm):
             self.tilt = torch.acos((1 - 2 * (x * x + y * y)).clamp(-1, 1))
             self.angular_speed = torch.linalg.vector_norm(data.root_link_ang_vel_b, dim=-1)
             linear_speed = torch.linalg.vector_norm(data.root_link_lin_vel_b, dim=-1)
-            supported = _sensor_any_contact(env, "feet_ground_contact")
-            body_contact = _sensor_any_contact(env, "turn_body_ground")
-            if supported is None or body_contact is None:
-                raise RuntimeError("Turn360 requires feet and non-foot ground-contact sensors")
             feet = env.scene.sensors["feet_ground_contact"].data.found
             foot_count = (feet.reshape(self.num_envs, 2, -1) > 0).any(-1).sum(-1)
             both_feet = foot_count == 2
             robot = env.scene["robot"]
             self.pose_error = _servo_joint_pos(env, robot) - _servo_default_joint_pos(env, robot)
             self.joint_velocity = _servo_joint_vel(env, robot)
-            self.air_time = torch.where(supported, 0.0, self.air_time + active * dt)
             finite = torch.isfinite(torch.cat((q, xy, data.root_link_ang_vel_b,
                                                data.root_link_lin_vel_b, self.pose_error,
                                                self.joint_velocity), dim=-1)).all(-1)
@@ -7827,11 +7821,10 @@ class Turn360Command(CommandTerm):
             speed_violation = (joint_speed > self.cfg.max_joint_speed
                                if self.cfg.max_joint_speed is not None else torch.zeros_like(active))
             self.failed = active & (
-                ~finite | body_contact | speed_violation | (self.tilt > self.cfg.failure_tilt)
+                ~finite | speed_violation | (self.tilt > self.cfg.failure_tilt)
                 | (self.drift > self.cfg.failure_radius)
-                | ((self.elapsed > 0.25) & (self.air_time > self.cfg.max_air_time))
             )
-            valid = active & supported & ~self.failed & (self.tilt < self.cfg.progress_tilt)
+            valid = active & ~self.failed & (self.tilt < self.cfg.progress_tilt)
             candidate = self.angle.clamp(0.0, self.cfg.target_angle)
             frontier = torch.where(valid, torch.maximum(self.frontier, candidate), self.frontier)
             self.progress = frontier - self.frontier

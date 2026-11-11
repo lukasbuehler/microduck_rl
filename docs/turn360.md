@@ -1,8 +1,8 @@
 # One controlled, stable 360° turn
 
-Task: `Mjlab-Turn360-Flat-MicroDuck`. Start standing, turn counterclockwise once
-on the feet, stop near the starting point and hold for 0.3 s. No wheels, jumping,
-reference motion or predefined gait. This is the first custom experiment, not a
+Task: `Mjlab-Turn360-Flat-MicroDuck`. Start standing, turn counterclockwise once,
+then stand near the starting point and hold for 0.3 s. Hopping is allowed. No
+wheels, reference motion or predefined gait. This is a custom experiment, not a
 claim of a trained result.
 
 ## Setup and first run (Linux/CUDA)
@@ -47,7 +47,12 @@ uv run --extra tracking train-tracked --run-name turn360-v1-seed42 \
 Changing environment count also changes PPO batch size. Keep it fixed when
 comparing reward versions. Repeat promising comparisons across several seeds.
 
-## Reward: v3, complete the turn within a servo-speed budget
+## Reward: v4, allow hops within the servo-speed budget
+
+The v4 change removes contact-based interruption and progress gating in both
+training and CPU playback. Airborne rotation and non-foot ground contact no
+longer fail an attempt. The final standing hold still requires both feet down.
+All reward weights and the 12 rad/s budget are unchanged from v3.
 
 There is no target yaw rate or prescribed duration. The eight-second deadline
 bounds an attempt; the servo-speed budget limits allowed motion. PPO's discount
@@ -55,7 +60,7 @@ still favors earlier rewards, so this is not mathematically timing-neutral.
 The explicit time and remaining-angle running costs are removed.
 
 Let theta be signed, unwrapped yaw relative to reset, and
-`p_t = max(p_(t-1), clip(theta_t, 0, 2*pi))` on valid supported steps.
+`p_t = max(p_(t-1), clip(theta_t, 0, 2*pi))` on valid upright steps.
 
 ```text
 reward = 4 * delta_progress / (2*pi)
@@ -70,8 +75,8 @@ reward = 4 * delta_progress / (2*pi)
        + roll/pitch-rate, action-rate and self-collision penalties
 ```
 
-Progress only pays while at least one foot touches the floor, tilt is below
-30 degrees, and there is no failure. Backtracking cannot repay visited angles;
+Progress pays while tilt is below 30 degrees and there is no failure, including
+while airborne. Backtracking cannot repay visited angles;
 spinning beyond 360 degrees earns no more progress. The once-per-episode rotation
 bonus uses the same 10-degree tolerance as success. It does not require settling,
 so completion can be learned before the final stance. A 65% turn earns partial
@@ -101,7 +106,7 @@ Success requires all of the following for 0.3 continuous seconds:
 - Signed rotation within 10 degrees of +360 degrees, not heading modulo 360.
 - Tilt below 15 degrees and horizontal drift below 6 cm.
 - Angular speed below 0.3 rad/s and linear speed below 0.05 m/s.
-- Both feet supported and no non-foot ground contact.
+- Both feet supported. Extra non-foot contact does not disqualify the finish.
 - Every servo within 0.25 rad (about 14 degrees) of configured HOME.
 - Every servo moving below 1.0 rad/s.
 
@@ -109,10 +114,11 @@ Success requires all of the following for 0.3 continuous seconds:
 joints. Exact world-space foot positions are not prescribed. These tolerances
 allow balance corrections; their feasibility still needs learned-rollout tests.
 
-Failure ends the attempt on non-foot ground contact, tilt above 45 degrees,
-drift above 20 cm, invalid state, more than 60 ms airborne after the initial
-250 ms grace period, or any measured servo speed above its budget. The budget
-has no reset grace period. One grounded foot is sufficient during rotation.
+Failure ends the attempt on tilt above 45 degrees, drift above 20 cm, invalid
+state or any measured servo speed above its budget. The budget has no reset
+grace period. Contact alone does not classify a fall; neither a body scrape nor
+loss of foot support interrupts the maneuver. Physics and collisions remain
+active. A fall is detected by the remaining posture/state checks.
 
 An unfinished eight-second attempt receives the same -8 failure payout.
 The deadline is a terminal task outcome, not a continuing-task truncation:
@@ -233,22 +239,26 @@ still finish in an arbitrary head/leg configuration and fail the new criteria.
 The walking handoff still needs rollout testing with the newly trained policy.
 Entry while walking is deliberately blocked because training starts at rest.
 
-### v3 experiment: next desktop check
+### v4 hopping experiment
+
+After pulling, the existing v3 ONNX can be replayed immediately with the relaxed
+contact checks. Its learned actions are unchanged. Retraining is required to
+learn airborne progress under the new objective.
 
 Pull branch `lukas`, then run the required five-iteration CUDA smoke test:
 
 ```bash
 git pull --ff-only origin lukas
-uv run --extra tracking train-tracked --run-name turn360-budget-v3-smoke \
+uv run --extra tracking train-tracked --run-name turn360-hops-v4-smoke \
   Mjlab-Turn360-Flat-MicroDuck \
   --env.scene.num-envs 64 --agent.max-iterations 5 --agent.seed 42
 ```
 
 After it passes, a fresh comparison run uses 2048 environments (matching the
-actual v2 run), seed 42 and 1000 iterations:
+actual v2/v3 runs), seed 42 and 1000 iterations:
 
 ```bash
-uv run --extra tracking train-tracked --run-name turn360-budget-v3-seed42 \
+uv run --extra tracking train-tracked --run-name turn360-hops-v4-seed42 \
   Mjlab-Turn360-Flat-MicroDuck \
   --env.scene.num-envs 2048 --agent.max-iterations 1000 --agent.seed 42
 ```
@@ -262,8 +272,8 @@ single-factor ablation. CPU tests do not establish CUDA execution or behavior.
 
 The first v1 combined-runner measurements failed after 0.16 s at 62-73 degrees,
 with peak yaw rates 11.35-12.84 rad/s and joint speeds 11.78-12.28 rad/s. These
-were early posture/contact failures. The runner distinguishes non-foot contact,
-tilt, drift and speed failures; none of these unit tests proves the learned
+were early posture/contact failures under the old rules. Non-foot contact no
+longer stops the runner; none of these unit tests proves the learned
 walking handoff works.
 
 For periodic training videos, append `--video --video-interval 5000
